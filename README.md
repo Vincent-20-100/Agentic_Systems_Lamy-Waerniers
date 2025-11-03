@@ -1,2 +1,2 @@
-# agentic_systems_project_lamy
+# Agentic systems project - lamy
 Albert School x Mines Paris PSL - Agentic Systms Project M1 - Vincent Lamy

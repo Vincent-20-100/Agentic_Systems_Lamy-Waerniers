@@ -1,3 +1,5 @@
-OPENAI_API_KEY.txt
-.venv-v2
-
+.OPENAI_API_KEY.txt
+.BIGQUERY_API_KEY.txt
+.venv
+.env
+quiet-dimension-427207-t0-69ba77624fb7.json
