@@ -1,198 +1,145 @@
-#####################################################################################
-#                                     IMPORTS                                       #
-#####################################################################################
-
+# === IMPORT ===
 import os
-import json
-import sqlite3
-from dotenv import load_dotenv
-from langchain.tools import tool
-from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Annotated, Sequence, Literal
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from typing import TypedDict, Annotated, Sequence
+from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 
+from tool_v2 import execute_sql_query, web_search, omdb_api, get_db_schema
 
-#####################################################################################
-#                                      TOOLS                                        #
-#####################################################################################
+# === CONFIG ===
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY", "")
+OMDB_BASE_URL = "http://www.omdbapi.com/"
 
-# tool 1: execute_sql_query
-@tool
-def execute_sql_query(sql_query: str, db_path: str) -> str:
-    """
-    Executes a SQL query on a local SQLite database.
-    Args:
-        sql_query (str): SQL query to execute.
-        db_path (str): Path to the SQLite database file.
-    Returns:
-        str: Results formatted as Markdown table or error message.
-    """
-    try:
-        connect = sqlite3.connect(db_path)
-        cursor = connect.cursor()
-        cursor.execute(sql_query)
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY manquant")
 
-        # Handle SELECT queries
-        if sql_query.strip().upper().startswith("SELECT"):
-            rows = cursor.fetchall()
-            if not rows:
-                return "No results found."
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-            # Get column names
-            column_names = [description[0] for description in cursor.description]
-            # Format as Markdown table
-            markdown_table = "  " + " | ".join(column_names) + " |\n"
-            markdown_table += "|" + "|".join(["---"] * len(column_names)) + "|\n"
-            for row in rows:
-                markdown_table += "| " + " | ".join(str(cell) for cell in row) + " |\n"
-            return markdown_table
-
-        # Handle INSERT/UPDATE/DELETE
-        else:
-            connect.commit()
-            return f"Query executed successfully. {cursor.rowcount} rows affected."
-
-    except sqlite3.Error as e:
-        return f"SQL Error: {str(e)}"
-    finally:
-        connect.close()
-
-# tool 2: get_db_schema
-@tool
-def get_db_schema(db_path: str = "./data") -> str:
-    """
-    Retrieves simplified schema information for all SQLite databases in JSON format.
-    Args:
-        db_path (str): Path to directory containing SQLite database files. Defaults to "../data".
-    Returns:
-        str: JSON string containing simplified schema information.
-    """
-    result = {
-        "databases": [],
-        "error": None
-    }
-
-    # Find all database files
-    db_files = []
-    for file in os.listdir(db_path):
-        if file.endswith(('.db', '.sqlite', '.sqlite3')):
-            db_files.append({
-                "path": os.path.join(db_path, file),
-                "name": os.path.basename(file)
-            })
-
-    if not db_files:
-        result["error"] = "No SQLite database files found in the specified directory."
-        return json.dumps(result, indent=2)
-
-    for db_file in db_files:
-        try:
-            conn = sqlite3.connect(db_file["path"])
-            cursor = conn.cursor()
-
-            database = {
-                "name": db_file["name"],
-                "path": db_file["path"],
-                "tables": []
-            }
-
-            # Get all tables
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = [table[0] for table in cursor.fetchall()]
-
-            for table in tables:
-                table_info = {
-                    "name": table,
-                    "columns": []    
-                }
-
-                # Get column information
-                cursor.execute(f"PRAGMA table_info({table})")
-                columns = cursor.fetchall()
-                for col in columns:
-                    table_info["columns"].append({
-                        "name": col[1],
-                        "type": col[2]
-                    })
-
-                database["tables"].append(table_info)
-
-            result["databases"].append(database)
-            conn.close()
-
-        except Exception as e:
-            result["databases"].append({
-                "name": db_file["name"],
-                "error": str(e)
-            })
-
-    return json.dumps(result, indent=2)
-
-
-#####################################################################################
-#                                       APP                                         #
-#####################################################################################
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Access the API keys
-api_key = os.getenv("OPENAI_API_KEY")
-
-# 1. Define agent state
+# === STATE ===
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[HumanMessage | AIMessage | ToolMessage], add_messages]
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    schema: str  # Data base schema
+    next_tool: str  # Tool to call ("sql", "web", "omdb", "none")
 
-# 2. Initialize LLM
-llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=api_key)
-tools = [get_db_schema, execute_sql_query]
+# === LLM WITH TOOLS ===
+tools = [execute_sql_query, web_search, omdb_api]
 llm_with_tools = llm.bind_tools(tools)
 
-# 3. Define nodes
-def call_model(state: AgentState):
-    """Call LLM with tools"""
-    response = llm_with_tools.invoke(state["messages"])
+# === WORKFLOW NODES ===
+
+def get_schema_node(state: AgentState) -> dict:
+    """Charge le schéma de la base de données."""
+    schema = get_db_schema.invoke({})
+    return {
+        "schema": schema,
+        "messages": [AIMessage(content=f"✅ Schéma chargé")]
+    }
+
+def chief_agent_node(state: AgentState) -> dict:
+    """Le chief analyse la requête et appelle l'outil approprié."""
+    prompt = f"""Tu es un assistant SQL/données. Tu as accès à :
+1. execute_sql_query : pour interroger netflix.db
+2. web_search : pour recherches web générales
+3. omdb_api : pour infos précises sur films/séries (IMDb, réalisateur, etc.)
+
+Schéma disponible :
+{state['schema']}
+
+Analyse la requête utilisateur et choisis L'OUTIL le plus adapté."""
+    
+    messages = [{"role": "system", "content": prompt}] + [
+        {"role": m.type, "content": m.content} for m in state["messages"]
+    ]
+    
+    response = llm_with_tools.invoke(messages)
+    
+    if response.tool_calls:
+        tool_name = response.tool_calls[0]["name"]
+        next_tool = {
+            "execute_sql_query": "sql",
+            "web_search": "web",
+            "omdb_api": "omdb"
+        }.get(tool_name, "none")
+        
+        return {
+            "next_tool": next_tool,
+            "messages": [response]
+        }
+    else:
+        return {
+            "next_tool": "none",
+            "messages": [response]
+        }
+
+def tool_executor_node(state: AgentState) -> dict:
+    """Exécute l'outil choisi par le chief."""
+    last_message = state["messages"][-1]
+    
+    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+        return {"messages": [AIMessage(content="⚠️ Aucun outil à exécuter")]}
+    
+    tool_call = last_message.tool_calls[0]
+    tool_name = tool_call["name"]
+    tool_args = tool_call["args"]
+    
+    tool_map = {
+        "execute_sql_query": execute_sql_query,
+        "web_search": web_search,
+        "omdb_api": omdb_api
+    }
+    
+    tool_func = tool_map.get(tool_name)
+    if not tool_func:
+        return {"messages": [AIMessage(content=f"⚠️ Outil {tool_name} inconnu")]}
+    
+    try:
+        result = tool_func.invoke(tool_args)
+        return {"messages": [AIMessage(content=f"📊 Résultat {tool_name}:\n{result}")]}
+    except Exception as e:
+        return {"messages": [AIMessage(content=f"❌ Erreur {tool_name}: {str(e)}")]}
+
+def synthesize_node(state: AgentState) -> dict:
+    """Synthétise les résultats en réponse finale."""
+    prompt = """Tu es un assistant qui synthétise les résultats.
+Fournis une réponse claire, concise et en français à l'utilisateur.
+Utilise les données disponibles dans l'historique des messages."""
+    
+    messages = [{"role": "system", "content": prompt}] + [
+        {"role": m.type, "content": m.content} for m in state["messages"]
+    ]
+    
+    response = llm.invoke(messages)
     return {"messages": [response]}
 
-def call_tool(state: AgentState):
-    """Execute tools"""
-    outputs = []
-    for tool_call in state["messages"][-1].tool_calls:
-        # Compatibilité : dict ou objet
-        name = getattr(tool_call, "name", tool_call.get("name"))
-        args = getattr(tool_call, "args", tool_call.get("args"))
-        call_id = getattr(tool_call, "id", tool_call.get("id"))
+# === ROUTING ===
 
-        if name == "get_db_schema":
-            result = get_db_schema.invoke({"db_path": "../data"})
-        else:
-            result = execute_sql_query.invoke(args)
+def route_after_chief(state: AgentState) -> Literal["tool_executor", "synthesize"]:
+    """Détermine si on exécute un outil ou si on synthétise directement."""
+    return "tool_executor" if state["next_tool"] != "none" else "synthesize"
 
-        outputs.append(ToolMessage(
-            content=result,
-            name=name,
-            tool_call_id=call_id
-        ))
-    return {"messages": outputs}
+# === GRAPH BUILD ===
 
-def should_continue(state: AgentState) -> str:
-    """Decide whether to continue"""
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tool"
-    return "end"
-
-# 4. Build graph
 workflow = StateGraph(AgentState)
-workflow.add_node("model", call_model)
-workflow.add_node("tool", call_tool)
-workflow.add_edge(START, "model")
+
+# Nodes
+workflow.add_node("get_schema", get_schema_node)
+workflow.add_node("chief_agent", chief_agent_node)
+workflow.add_node("tool_executor", tool_executor_node)
+workflow.add_node("synthesize", synthesize_node)
+
+# Edges
+workflow.add_edge(START, "get_schema")
+workflow.add_edge("get_schema", "chief_agent")
 workflow.add_conditional_edges(
-    "model",
-    should_continue,
-    {"tool": "tool", "end": END}
+    "chief_agent",
+    route_after_chief,
+    {"tool_executor": "tool_executor", "synthesize": "synthesize"}
 )
-workflow.add_edge("tool", "model")
+workflow.add_edge("tool_executor", "synthesize")
+workflow.add_edge("synthesize", END)
+
 app = workflow.compile()
