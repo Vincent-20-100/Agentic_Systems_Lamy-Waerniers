@@ -1,3 +1,5 @@
+################ PROBLEME DE CHEMIN DE BASE DE DONNEES A REGARDER ################
+
 """
 SQL Agent with Memory, Sources, and Human-in-loop
 Launch: streamlit run app.py
@@ -29,13 +31,13 @@ st.title("🤖 Agent SQL Netflix")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE_URL = "http://www.omdbapi.com/"
-DB_PATH = os.getenv("DB_PATH", "../data/netflix.db")
+DB_FOLDER_PATH = os.getenv("DB_FOLDER_PATH", "../data")
 
 if not OPENAI_API_KEY:
     st.error("❌ OPENAI_API_KEY missing in .env")
     st.stop()
 
-llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
 
 # === AGENT STATE ===
 class AgentState(TypedDict):
@@ -66,20 +68,20 @@ def extract_urls(text: str) -> list:
 
 # === TOOLS ===
 @tool
-def get_db_schema(db_path: str = "../data") -> str:
+def get_db_schema(DB_FOLDER_PATH: str = "../data") -> str:
     """Get schema of all SQLite databases in folder"""
     result = {"databases": [], "error": None}
     
     try:
-        db_files = [f for f in os.listdir(db_path) if f.endswith(('.db', '.sqlite', '.sqlite3'))]
+        db_files = [f for f in os.listdir(DB_FOLDER_PATH) if f.endswith(('.db', '.sqlite', '.sqlite3'))]
     except FileNotFoundError:
-        return json.dumps({"error": f"Folder {db_path} not found"})
-    
+        return json.dumps({"error": f"Folder {DB_FOLDER_PATH} not found"})
+
     if not db_files:
         return json.dumps({"error": "No SQLite databases found"})
     
     for db_file in db_files:
-        db_path_full = os.path.join(db_path, db_file)
+        db_path_full = os.path.join(DB_FOLDER_PATH, db_file)
         try:
             conn = sqlite3.connect(db_path_full)
             cursor = conn.cursor()
@@ -102,8 +104,8 @@ def get_db_schema(db_path: str = "../data") -> str:
 
 @tool
 def execute_sql_query(query: str, db_path: str = None) -> str:
-    """Execute SQL query on netflix.db"""
-    path = db_path or DB_PATH
+    """Execute SQL query on the database"""
+    path = db_path
     
     if not os.path.exists(path):
         return json.dumps({"error": f"Database {path} not found"})
@@ -298,7 +300,7 @@ def tool_executor_node(state: AgentState) -> dict:
         # Track source
         source = ""
         if tool_name == "execute_sql_query":
-            source = f"🗄️ Database: [{os.path.basename(DB_PATH)}](file://{os.path.abspath(DB_PATH)})"
+            source = f"🗄️ Database: [{os.path.basename(DB_FOLDER_PATH)}](file://{os.path.abspath(DB_FOLDER_PATH)})"
         elif tool_name == "omdb_api":
             title = tool_args.get('t', tool_args.get('i', 'unknown'))
             url = f"{OMDB_BASE_URL}?t={title.replace(' ', '+')}&apikey=***"
