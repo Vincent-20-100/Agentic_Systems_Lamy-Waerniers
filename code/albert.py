@@ -1,6 +1,6 @@
 """
-Interface Streamlit SIMPLE pour l'Agent SQL
-Lancer avec : streamlit run app.py
+SQL Agent with Memory, Sources, and Human-in-loop
+Launch: streamlit run app.py
 """
 
 import streamlit as st
@@ -8,6 +8,7 @@ import os
 import json
 import sqlite3
 import requests
+import re
 from typing import TypedDict, Annotated, Sequence, Literal
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
@@ -17,43 +18,65 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 
-# Charger les variables d'environnement
+# Load environment variables
 load_dotenv()
 
 # Configuration
-st.set_page_config(page_title="Agent SQL", page_icon="🤖")
+st.set_page_config(page_title="Agent SQL", page_icon="🤖", layout="wide")
 st.title("🤖 Agent SQL Netflix")
 
-# === RÉCUPÉRATION DES CLÉS (depuis .env) ===
+# API Keys from .env
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE_URL = "http://www.omdbapi.com/"
+DB_PATH = os.getenv("DB_PATH", "../data/netflix.db")
 
 if not OPENAI_API_KEY:
-    st.error("❌ OPENAI_API_KEY manquant dans .env")
+    st.error("❌ OPENAI_API_KEY missing in .env")
     st.stop()
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=OPENAI_API_KEY)
 
-# === ÉTAT AGENT ===
+# === AGENT STATE ===
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     schema: str
     next_tool: str
+    sources_used: list  # Track sources
+    needs_clarification: bool
+    clarification_question: str
+    current_step: str  # For real-time display
 
-# === OUTILS (ton code original) ===
+# === HELPER FUNCTIONS ===
+def clean_json(text: str) -> str:
+    """Clean JSON from markdown formatting"""
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+def extract_urls(text: str) -> list:
+    """Extract URLs from text"""
+    url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+    return re.findall(url_pattern, text)
+
+# === TOOLS ===
 @tool
 def get_db_schema(db_path: str = "../data") -> str:
-    """Récupère le schéma de toutes les bases SQLite du dossier."""
+    """Get schema of all SQLite databases in folder"""
     result = {"databases": [], "error": None}
     
     try:
         db_files = [f for f in os.listdir(db_path) if f.endswith(('.db', '.sqlite', '.sqlite3'))]
     except FileNotFoundError:
-        return json.dumps({"error": f"Dossier {db_path} introuvable"})
+        return json.dumps({"error": f"Folder {db_path} not found"})
     
     if not db_files:
-        return json.dumps({"error": "Aucune base SQLite trouvée"})
+        return json.dumps({"error": "No SQLite databases found"})
     
     for db_file in db_files:
         db_path_full = os.path.join(db_path, db_file)
@@ -78,13 +101,15 @@ def get_db_schema(db_path: str = "../data") -> str:
     return json.dumps(result, indent=2)
 
 @tool
-def execute_sql_query(query: str, db_path: str = "../data/netflix.db") -> str:
-    """Exécute une requête SQL sur netflix.db."""
-    if not os.path.exists(db_path):
-        return json.dumps({"error": f"Base {db_path} introuvable"})
+def execute_sql_query(query: str, db_path: str = None) -> str:
+    """Execute SQL query on netflix.db"""
+    path = db_path or DB_PATH
+    
+    if not os.path.exists(path):
+        return json.dumps({"error": f"Database {path} not found"})
     
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(path)
         cursor = conn.cursor()
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -93,23 +118,23 @@ def execute_sql_query(query: str, db_path: str = "../data/netflix.db") -> str:
         conn.close()
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
-        return json.dumps({"error": f"Erreur SQL: {str(e)}"})
+        return json.dumps({"error": f"SQL Error: {str(e)}"})
 
 @tool
 def web_search(query: str, num_results: int = 5) -> str:
-    """Recherche web via DuckDuckGo."""
+    """Web search via DuckDuckGo"""
     try:
         search = DuckDuckGoSearchResults(num_results=num_results)
         return search.run(query)
     except Exception as e:
-        return json.dumps({"error": f"Erreur web search: {str(e)}"})
+        return json.dumps({"error": f"Web search error: {str(e)}"})
 
 @tool
 def omdb_api(by: str = "search", i: str = None, t: str = None, 
              s: str = None, y: str = None, plot: str = "short") -> str:
-    """Interroge l'API OMDb pour infos films/séries."""
+    """Query OMDb API for movie/series info"""
     if not OMDB_API_KEY:
-        return json.dumps({"error": "Clé OMDB_API_KEY manquante"})
+        return json.dumps({"error": "OMDB_API_KEY missing"})
     
     params = {"apikey": OMDB_API_KEY, "plot": plot}
     
@@ -120,7 +145,7 @@ def omdb_api(by: str = "search", i: str = None, t: str = None,
     elif by == "search" and s:
         params["s"] = s
     else:
-        return json.dumps({"error": "Paramètres manquants (i/t/s selon 'by')"})
+        return json.dumps({"error": "Missing parameters (i/t/s depending on 'by')"})
     
     if y:
         params["y"] = y
@@ -130,27 +155,95 @@ def omdb_api(by: str = "search", i: str = None, t: str = None,
         response.raise_for_status()
         return response.text
     except requests.exceptions.RequestException as e:
-        return json.dumps({"error": f"Erreur API OMDb: {str(e)}"})
+        return json.dumps({"error": f"OMDb API error: {str(e)}"})
 
-# Lier les outils
+# Bind tools to LLM
 tools = [execute_sql_query, web_search, omdb_api]
 llm_with_tools = llm.bind_tools(tools)
 
-# === NŒUDS (ton code original) ===
+# === WORKFLOW NODES ===
+
 def get_schema_node(state: AgentState) -> dict:
+    """Load database schema"""
     schema = get_db_schema.invoke({})
-    return {"schema": schema, "messages": [AIMessage(content=f"✅ Schéma chargé")]}
+    return {
+        "schema": schema,
+        "current_step": "schema_loaded",
+        "messages": [AIMessage(content="✅ Schema loaded")]
+    }
+
+def clarify_question_node(state: AgentState) -> dict:
+    """Analyze question and ask for clarification if needed"""
+    user_question = state["messages"][-1].content
+    
+    # Skip clarification if it's a response to a previous clarification
+    if len(state["messages"]) > 2 and state.get("needs_clarification"):
+        return {
+            "needs_clarification": False,
+            "current_step": "clarification_answered",
+            "messages": [AIMessage(content="✅ Thanks for clarification")]
+        }
+    
+    prompt = f"""Analyze this question: "{user_question}"
+
+Available context:
+- Database netflix.db (movies, series, years, ratings)
+- OMDb API (detailed movie/series info)
+- Web search (news, recent releases)
+
+Is the question:
+- CLEAR: can answer directly
+- AMBIGUOUS: need clarification
+
+Examples of AMBIGUOUS:
+- "a movie" → which movie?
+- "when released?" → which title?
+- "good series" → genre? year?
+
+Respond ONLY in JSON:
+{{
+  "status": "clear" or "ambiguous",
+  "clarification": "Question to ask user" (if ambiguous),
+  "reasoning": "Why it's ambiguous"
+}}"""
+    
+    response = llm.invoke(prompt)
+    
+    try:
+        decision = json.loads(clean_json(response.content))
+        
+        if decision["status"] == "ambiguous":
+            return {
+                "needs_clarification": True,
+                "clarification_question": decision["clarification"],
+                "current_step": "waiting_clarification",
+                "messages": [AIMessage(content=decision["clarification"])]
+            }
+        else:
+            return {
+                "needs_clarification": False,
+                "current_step": "question_clear",
+                "messages": [AIMessage(content="✅ Question clear, analyzing...")]
+            }
+    except:
+        # If JSON parsing fails, assume clear
+        return {
+            "needs_clarification": False,
+            "current_step": "question_clear",
+            "messages": [AIMessage(content="✅ Analyzing...")]
+        }
 
 def chief_agent_node(state: AgentState) -> dict:
-    prompt = f"""Tu es un assistant SQL/données. Tu as accès à :
-1. execute_sql_query : pour interroger netflix.db
-2. web_search : pour recherches web générales
-3. omdb_api : pour infos précises sur films/séries
+    """Chief analyzes and calls appropriate tool"""
+    prompt = f"""You are a SQL/data assistant. You have access to:
+1. execute_sql_query: query netflix.db
+2. web_search: general web searches
+3. omdb_api: detailed movie/series info
 
-Schéma disponible :
+Available schema:
 {state['schema']}
 
-Analyse la requête utilisateur et choisis L'OUTIL le plus adapté."""
+Analyze the user request and choose THE MOST appropriate tool."""
     
     messages = [{"role": "system", "content": prompt}] + [
         {"role": m.type, "content": m.content} for m in state["messages"]
@@ -166,15 +259,24 @@ Analyse la requête utilisateur et choisis L'OUTIL le plus adapté."""
             "omdb_api": "omdb"
         }.get(tool_name, "none")
         
-        return {"next_tool": next_tool, "messages": [response]}
+        return {
+            "next_tool": next_tool,
+            "current_step": f"calling_{tool_name}",
+            "messages": [response]
+        }
     else:
-        return {"next_tool": "none", "messages": [response]}
+        return {
+            "next_tool": "none",
+            "current_step": "direct_answer",
+            "messages": [response]
+        }
 
 def tool_executor_node(state: AgentState) -> dict:
+    """Execute the chosen tool and track sources"""
     last_message = state["messages"][-1]
     
     if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-        return {"messages": [AIMessage(content="⚠️ Aucun outil à exécuter")]}
+        return {"messages": [AIMessage(content="⚠️ No tool to execute")]}
     
     tool_call = last_message.tool_calls[0]
     tool_name = tool_call["name"]
@@ -188,46 +290,100 @@ def tool_executor_node(state: AgentState) -> dict:
     
     tool_func = tool_map.get(tool_name)
     if not tool_func:
-        return {"messages": [AIMessage(content=f"⚠️ Outil {tool_name} inconnu")]}
+        return {"messages": [AIMessage(content=f"⚠️ Unknown tool {tool_name}")]}
     
     try:
         result = tool_func.invoke(tool_args)
-        return {"messages": [AIMessage(content=f"📊 Résultat {tool_name}:\n{result}")]}
+        
+        # Track source
+        source = ""
+        if tool_name == "execute_sql_query":
+            source = f"🗄️ Database: [{os.path.basename(DB_PATH)}](file://{os.path.abspath(DB_PATH)})"
+        elif tool_name == "omdb_api":
+            title = tool_args.get('t', tool_args.get('i', 'unknown'))
+            url = f"{OMDB_BASE_URL}?t={title.replace(' ', '+')}&apikey=***"
+            source = f"🎬 OMDb API: [{title}]({url})"
+        elif tool_name == "web_search":
+            # Extract URLs from result
+            urls = extract_urls(result)
+            if urls:
+                source = f"🌐 Web: [DuckDuckGo]({urls[0]})"
+            else:
+                source = "🌐 Web: DuckDuckGo Search"
+        
+        return {
+            "messages": [AIMessage(content=f"📊 Result:\n{result}")],
+            "sources_used": state.get("sources_used", []) + [source],
+            "current_step": f"{tool_name}_completed"
+        }
     except Exception as e:
-        return {"messages": [AIMessage(content=f"❌ Erreur {tool_name}: {str(e)}")]}
+        return {"messages": [AIMessage(content=f"❌ Error {tool_name}: {str(e)}")]}
 
 def synthesize_node(state: AgentState) -> dict:
-    prompt = """Tu es un assistant qui synthétise les résultats.
-Fournis une réponse claire, concise et en français à l'utilisateur.
-Utilise les données disponibles dans l'historique des messages."""
+    """Synthesize results and add sources"""
+    sources = state.get("sources_used", [])
+    sources_text = "\n".join([f"- {s}" for s in sources]) if sources else ""
+    
+    prompt = f"""You are an assistant that synthesizes results.
+Provide a clear, concise answer in French to the user.
+Use the data available in the message history.
+
+At the END of your response, add a section:
+
+**📚 Sources:**
+{sources_text}
+
+Be natural, don't mention "based on the data" or similar."""
     
     messages = [{"role": "system", "content": prompt}] + [
         {"role": m.type, "content": m.content} for m in state["messages"]
     ]
     
     response = llm.invoke(messages)
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "current_step": "synthesis_complete"
+    }
+
+# === ROUTING ===
+
+def route_after_clarify(state: AgentState) -> Literal["wait_user", "chief_agent"]:
+    """Route based on clarification need"""
+    return "wait_user" if state.get("needs_clarification") else "chief_agent"
 
 def route_after_chief(state: AgentState) -> Literal["tool_executor", "synthesize"]:
+    """Route based on tool choice"""
     return "tool_executor" if state["next_tool"] != "none" else "synthesize"
 
-# === CONSTRUCTION DU GRAPHE ===
+# === BUILD GRAPH ===
+
 @st.cache_resource
 def build_agent():
+    """Build and compile the LangGraph workflow"""
     workflow = StateGraph(AgentState)
     
     workflow.add_node("get_schema", get_schema_node)
+    workflow.add_node("clarify_question", clarify_question_node)
     workflow.add_node("chief_agent", chief_agent_node)
     workflow.add_node("tool_executor", tool_executor_node)
     workflow.add_node("synthesize", synthesize_node)
+    workflow.add_node("wait_user", lambda state: state)  # Dummy node
     
     workflow.add_edge(START, "get_schema")
-    workflow.add_edge("get_schema", "chief_agent")
+    workflow.add_edge("get_schema", "clarify_question")
+    
+    workflow.add_conditional_edges(
+        "clarify_question",
+        route_after_clarify,
+        {"wait_user": END, "chief_agent": "chief_agent"}
+    )
+    
     workflow.add_conditional_edges(
         "chief_agent",
         route_after_chief,
         {"tool_executor": "tool_executor", "synthesize": "synthesize"}
     )
+    
     workflow.add_edge("tool_executor", "synthesize")
     workflow.add_edge("synthesize", END)
     
@@ -235,47 +391,138 @@ def build_agent():
 
 app = build_agent()
 
-# === INTERFACE STREAMLIT SIMPLE ===
+# === STREAMLIT INTERFACE ===
 
-# Initialiser l'historique
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# Initialize session state
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
 
-# Afficher l'historique
-for message in st.session_state.messages:
+if "agent_messages" not in st.session_state:
+    st.session_state.agent_messages = []
+
+if "schema" not in st.session_state:
+    st.session_state.schema = ""
+
+if "sources" not in st.session_state:
+    st.session_state.sources = []
+
+if "welcome_shown" not in st.session_state:
+    st.session_state.welcome_shown = False
+
+# Show welcome message on first load
+if not st.session_state.welcome_shown:
+    # Load schema to display available resources
+    schema_result = get_db_schema.invoke({})
+    st.session_state.schema = schema_result
+    
+    try:
+        schema_data = json.loads(schema_result)
+        
+        # Format welcome message
+        welcome_msg = "👋 **Bienvenue !** Voici les ressources disponibles :\n\n"
+        welcome_msg += "### 📊 Bases de données :\n"
+        
+        for db in schema_data.get("databases", []):
+            welcome_msg += f"\n**{db['name']}**\n"
+            for table in db.get("tables", []):
+                cols = ", ".join([f"`{col['name']}`" for col in table.get("columns", [])])
+                welcome_msg += f"  • Table `{table['name']}` : {cols}\n"
+        
+        welcome_msg += "\n### 🔧 Outils disponibles :\n"
+        welcome_msg += "- 🗄️ Requêtes SQL sur les bases\n"
+        welcome_msg += "- 🎬 OMDb API pour infos films/séries détaillées\n"
+        welcome_msg += "- 🌐 Recherche web pour actualités\n\n"
+        welcome_msg += "💬 **Posez votre question !**"
+        
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": welcome_msg
+        })
+        st.session_state.welcome_shown = True
+        
+    except:
+        # Fallback if schema parsing fails
+        welcome_msg = "👋 **Bienvenue !** Je suis prêt à vous aider avec la base Netflix. Posez votre question !"
+        st.session_state.chat_messages.append({
+            "role": "assistant",
+            "content": welcome_msg
+        })
+        st.session_state.welcome_shown = True
+
+# Display chat history
+for message in st.session_state.chat_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Input utilisateur
-if prompt := st.chat_input("Posez votre question..."):
-    # Ajouter message utilisateur
-    st.session_state.messages.append({"role": "user", "content": prompt})
+# User input
+if prompt := st.chat_input("Ask your question..."):
+    # Add user message
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+    st.session_state.agent_messages.append(HumanMessage(content=prompt))
+    
+    # Keep only last 100 messages
+    if len(st.session_state.agent_messages) > 100:
+        st.session_state.agent_messages = st.session_state.agent_messages[-100:]
     
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Exécuter l'agent
+    # Execute agent with real-time display
     with st.chat_message("assistant"):
-        with st.spinner("Réflexion..."):
-            inputs = {
-                "messages": [HumanMessage(content=prompt)],
-                "schema": "",
-                "next_tool": ""
-            }
+        status_placeholder = st.empty()
+        response_placeholder = st.empty()
+        
+        inputs = {
+            "messages": st.session_state.agent_messages,
+            "schema": st.session_state.schema,
+            "next_tool": "",
+            "sources_used": [],
+            "needs_clarification": False,
+            "clarification_question": "",
+            "current_step": ""
+        }
+        
+        result = None
+        
+        # Stream with status updates
+        for step in app.stream(inputs, stream_mode="values"):
+            result = step
+            current_step = step.get("current_step", "")
             
-            # Récupérer la réponse finale
-            result = None
-            for step in app.stream(inputs, stream_mode="values"):
-                result = step
+            # Update status based on step
+            if current_step == "schema_loaded":
+                status_placeholder.info("📂 Loading schema...")
+            elif current_step == "question_clear":
+                status_placeholder.info("✅ Question analyzed...")
+            elif current_step.startswith("calling_"):
+                tool = current_step.replace("calling_", "")
+                if tool == "execute_sql_query":
+                    status_placeholder.info("🗄️ Querying database...")
+                elif tool == "web_search":
+                    status_placeholder.info("🌐 Searching the web...")
+                elif tool == "omdb_api":
+                    status_placeholder.info("🎬 Calling OMDb API...")
+            elif current_step.endswith("_completed"):
+                status_placeholder.success("✅ Data retrieved!")
+            elif current_step == "synthesis_complete":
+                status_placeholder.success("💬 Response ready!")
+        
+        # Display final response
+        if result:
+            status_placeholder.empty()
             
-            # Afficher la réponse
-            if result:
-                final_message = result["messages"][-1]
-                response_text = final_message.content
-                st.markdown(response_text)
-                
-                # Sauvegarder dans l'historique
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response_text
-                })
+            final_message = result["messages"][-1]
+            response_text = final_message.content
+            
+            response_placeholder.markdown(response_text)
+            
+            # Save to history
+            st.session_state.chat_messages.append({
+                "role": "assistant",
+                "content": response_text
+            })
+            
+            # Update agent messages and schema
+            st.session_state.agent_messages = result["messages"]
+            st.session_state.schema = result.get("schema", st.session_state.schema)
+            st.session_state.sources = result.get("sources_used", [])
