@@ -1,6 +1,8 @@
 import streamlit as st
 from langchain_core.messages import HumanMessage
 from main import app
+from dotenv import load_dotenv
+import os
 
 st.set_page_config(page_title="SQL Assistant", page_icon="💬", layout="centered")
 
