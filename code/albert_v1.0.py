@@ -1,10 +1,14 @@
+"""
+SQL Agent with Memory, Sources, and Human-in-loop
+Launch: streamlit run app.py
+"""
+
 import streamlit as st
 import os
 import json
 import sqlite3
 import requests
 import re
-from pathlib import Path
 from typing import TypedDict, Annotated, Sequence, Literal
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
@@ -13,19 +17,23 @@ from langchain_community.tools import DuckDuckGoSearchResults
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
+import pathlib
 
 # Load environment variables
 load_dotenv()
 
 # Configuration
 st.set_page_config(page_title="Albert Query", page_icon="🧙‍♂️", layout="wide")
-st.title("🧙‍♂️ Albert Query")
+#st.title("🧙‍♂️ Albert Query")
 
 # API Keys from .env
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE_URL = "http://www.omdbapi.com/"
-DB_FOLDER_PATH = r"../data"
+
+# Chemin absolu vers les databases
+SCRIPT_DIR = pathlib.Path(__file__).parent.absolute()
+DB_FOLDER_PATH = str(SCRIPT_DIR.parent / "data")
 
 if not OPENAI_API_KEY:
     st.error("❌ OPENAI_API_KEY missing in .env")
@@ -38,10 +46,10 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     db_catalog: dict
     next_tool: str
-    sources_used: list  # Track sources
+    sources_used: list
     needs_clarification: bool
     clarification_question: str
-    current_step: str  # For real-time display
+    current_step: str
 
 # === HELPER FUNCTIONS ===
 def clean_json(text: str) -> str:
@@ -61,7 +69,7 @@ def extract_urls(text: str) -> list:
     return re.findall(url_pattern, text)
 
 def build_db_catalog(folder_path: str) -> dict:
-    """Construit un catalogue complet des databases avec chemins et schémas"""
+    """🆕 Construit un catalogue complet des databases avec chemins et schémas"""
     catalog = {
         "folder_path": folder_path,
         "databases": {},
@@ -105,8 +113,11 @@ def build_db_catalog(folder_path: str) -> dict:
                         {
                             "name": col[1],
                             "type": col[2],
+                            "not_null": bool(col[3]),
+                            "primary_key": bool(col[5])
                         } for col in columns_info
                     ],
+                    "column_names": [col[1] for col in columns_info]
                 }
             
             catalog["databases"][db_name] = db_info
@@ -122,7 +133,7 @@ def build_db_catalog(folder_path: str) -> dict:
     return catalog
 
 def format_catalog_for_llm(catalog: dict) -> str:
-    """Formate le catalogue pour le LLM"""
+    """🆕 Formate le catalogue pour le LLM"""
     if catalog.get("error"):
         return f"ERROR: {catalog['error']}"
     
@@ -145,51 +156,30 @@ def format_catalog_for_llm(catalog: dict) -> str:
     return formatted
 
 # === TOOLS ===
-"""@tool
-def get_db_schema(DB_FOLDER_PATH: str = DB_FOLDER_PATH) -> str:
-    "Get schema of all SQLite databases in folder"
-    result = {"databases": [], "error": None}
-    
-    try:
-        db_files = [f for f in os.listdir(DB_FOLDER_PATH) if f.endswith(('.db', '.sqlite', '.sqlite3'))]
-    except FileNotFoundError:
-        return json.dumps({"error": f"Folder {DB_FOLDER_PATH} not found"})
-
-    if not db_files:
-        return json.dumps({"error": "No SQLite databases found"})
-    
-    for db_file in db_files:
-        db_path_full = os.path.join(DB_FOLDER_PATH, db_file)
-        try:
-            conn = sqlite3.connect(db_path_full)
-            cursor = conn.cursor()
-            
-            database = {"name": db_file, "tables": []}
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            
-            for (table_name,) in tables:
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns = [{"name": col[1], "type": col[2]} for col in cursor.fetchall()]
-                database["tables"].append({"name": table_name, "columns": columns})
-            
-            result["databases"].append(database)
-            conn.close()
-        except Exception as e:
-            result["databases"].append({"name": db_file, "error": str(e)})
-    
-    return json.dumps(result, indent=2)"""
-
 @tool
-def execute_sql_query(query: str, db_path: str = None) -> str:
-    """Execute SQL query on the database"""
-    path = db_path
+def execute_sql_query(query: str, db_name: str, state_catalog: dict) -> str:
+    """🆕 Execute SQL query using catalog state"""
+    catalog = state_catalog
     
-    if not os.path.exists(path):
-        return json.dumps({"error": f"Database {path} not found"})
+    # Vérifier que la database existe dans le catalogue
+    if db_name not in catalog["databases"]:
+        available = ", ".join(catalog["databases"].keys())
+        return json.dumps({
+            "error": f"Database '{db_name}' not found in catalog. Available: {available}"
+        })
+    
+    db_info = catalog["databases"][db_name]
+    
+    if "error" in db_info:
+        return json.dumps({"error": f"Database error: {db_info['error']}"})
+    
+    db_path = db_info["full_path"]
+    
+    if not os.path.exists(db_path):
+        return json.dumps({"error": f"Database file not found: {db_path}"})
     
     try:
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -210,55 +200,9 @@ def web_search(query: str, num_results: int = 5) -> str:
         return json.dumps({"error": f"Web search error: {str(e)}"})
 
 @tool
-def omdb_api(
-    by: Literal["id", "title", "search"] = "search",
-    i: str | None = None,      # IMDb ID (tt...)
-    t: str | None = None,      # Exact title
-    s: str | None = None,      # Search keyword
-    y: str | None = None,      # Year
-    plot: Literal["short", "full"] = "short",
-    type: Literal["movie", "series", "episode"] | None = None,
-    page: int | None = None,
-) -> str:
-    """
-    Query the OMDb API to get movie, series, or episode information.
-
-    Use exactly one of the following modes:
-
-    1. **By ID**: `by="id"`, provide `i="tt1375666"`
-    2. **By Title**: `by="title"`, provide `t="Inception"`
-    3. **By Search**: `by="search"`, provide `s="joker"`, optionally `y`, `type`, `page`
-
-    Parameters
-    ----------
-    by : "id" | "title" | "search"
-        Query mode. Default: "search"
-    i : str, optional
-        IMDb ID (e.g., "tt1375666"). Required if by="id"
-    t : str, optional
-        Exact title. Required if by="title"
-    s : str, optional
-        Search keyword. Required if by="search"
-    y : str, optional
-        Release year (4 digits)
-    plot : "short" | "full"
-        Plot summary length. Default: "short"
-    type : "movie" | "series" | "episode", optional
-        Filter results by type
-    page : int, optional
-        Page number for search results (1–100)
-
-    Returns
-    -------
-    str
-        JSON string with movie data (or error message)
-
-    Examples
-    --------
-    >>> omdb_api(by="title", t="Inception", plot="full")
-    >>> omdb_api(by="search", s="batman", y="2008", type="movie")
-    >>> omdb_api(by="id", i="tt1375666")
-    """
+def omdb_api(by: str = "search", i: str = None, t: str = None, 
+             s: str = None, y: str = None, plot: str = "short") -> str:
+    """Query OMDb API for movie/series info"""
     if not OMDB_API_KEY:
         return json.dumps({"error": "OMDB_API_KEY missing"})
     
@@ -283,14 +227,14 @@ def omdb_api(
     except requests.exceptions.RequestException as e:
         return json.dumps({"error": f"OMDb API error: {str(e)}"})
 
-# Bind tools to LLM
-tools = [execute_sql_query, web_search, omdb_api]
+# Bind tools to LLM (sans execute_sql_query pour l'instant)
+tools = [web_search, omdb_api]
 llm_with_tools = llm.bind_tools(tools)
 
 # === WORKFLOW NODES ===
 
 def get_schema_node(state: AgentState) -> dict:
-    """Charge le catalogue complet des databases"""
+    """🆕 Charge le catalogue complet des databases"""
     catalog = build_db_catalog(DB_FOLDER_PATH)
     
     if catalog.get("error"):
@@ -369,14 +313,25 @@ Respond ONLY in JSON:
         }
 
 def chief_agent_node(state: AgentState) -> dict:
-    """Chief analyzes and calls appropriate tool"""
+    """Chief analyzes and calls appropriate tool with catalog context"""
+    catalog_info = format_catalog_for_llm(state["db_catalog"])
+    
     prompt = f"""You are a SQL/data assistant. You have access to:
-1. execute_sql_query: query netflix.db
-2. web_search: general web searches
-3. omdb_api: detailed movie/series info
 
-Available schema:
-{state['schema']}
+1. **execute_sql_query**: Query databases
+   - You MUST provide: query (SQL), db_path (full path from catalog)
+   - Use the catalog below to know which db_path and tables to use
+
+2. **web_search**: General web searches
+
+3. **omdb_api**: Detailed movie/series info
+
+{catalog_info}
+
+⚠️ IMPORTANT for SQL queries:
+- Always specify the correct 'db_path' (use full_path from catalog)
+- Refer to the catalog above for exact table and column names
+- Write valid SQLite syntax
 
 Analyze the user request and choose THE MOST appropriate tool."""
     
@@ -433,19 +388,13 @@ def tool_executor_node(state: AgentState) -> dict:
         # Track source
         source = ""
         if tool_name == "execute_sql_query":
-            tool_args["state_catalog"] = state["db_catalog"]
-            result = execute_sql_query.invoke(tool_args)
-            db_name = tool_args.get("db_name", "unknown")
-            db_info = state["db_catalog"]["databases"].get(db_name, {})
-            db_path = db_info.get("full_path", "unknown")
-            source = f"🗄️ Database: {db_name} [{db_path}]"
+            db_path = tool_args.get("db_path", "unknown")
+            source = f"🗄️ Database: [{db_path}]"
         elif tool_name == "omdb_api":
-            result = omdb_api.invoke(tool_args)
             title = tool_args.get('t', tool_args.get('i', 'unknown'))
             url = f"{OMDB_BASE_URL}?t={title.replace(' ', '+')}&apikey=***"
             source = f"🎬 OMDb API: [{title}]({url})"
         elif tool_name == "web_search":
-            # Extract URLs from result
             urls = extract_urls(result)
             if urls:
                 source = f"🌐 Web: [DuckDuckGo]({urls[0]})"
@@ -508,7 +457,7 @@ def build_agent():
     workflow.add_node("chief_agent", chief_agent_node)
     workflow.add_node("tool_executor", tool_executor_node)
     workflow.add_node("synthesize", synthesize_node)
-    workflow.add_node("wait_user", lambda state: state)  # Dummy node
+    workflow.add_node("wait_user", lambda state: state)
     
     workflow.add_edge(START, "get_schema")
     workflow.add_edge("get_schema", "clarify_question")
@@ -541,8 +490,11 @@ if "chat_messages" not in st.session_state:
 if "agent_messages" not in st.session_state:
     st.session_state.agent_messages = []
 
-if "schema" not in st.session_state:
-    st.session_state.schema = ""
+if "db_catalog" not in st.session_state:
+    st.session_state.db_catalog = {}
+
+if "db_catalog" not in st.session_state:
+    st.session_state.db_catalog = {}
 
 if "sources" not in st.session_state:
     st.session_state.sources = []
@@ -552,49 +504,37 @@ if "welcome_shown" not in st.session_state:
 
 # Show welcome message on first load
 if not st.session_state.welcome_shown:
-    # Load schema to display available resources
-    schema_result = get_schema_node(AgentState())
-    st.session_state.schema = schema_result
+    catalog = build_db_catalog(DB_FOLDER_PATH)
+    st.session_state.db_catalog = catalog
     
-    try:
-        schema_data = json.loads(schema_result)
+    if catalog.get("error"):
+        welcome_msg = f"⚠️ **Erreur de chargement:** {catalog['error']}"
+    else:
+        welcome_msg = "##### 👋 **Salut !** Moi c'est **Albert**,\n\n###### 🧐 Je vais t'aider à y voir clair dans tes données !\n\n"
+        welcome_msg += "\n\n ###### 📊 Bases de données disponibles :\n\n"
         
-        # Format welcome message
-        welcome_msg = "👋 **Bienvenue !** Voici les ressources disponibles :\n\n"
-        welcome_msg += "### 📊 Bases de données :\n"
+        for db_name, db_info in catalog["databases"].items():
+            if "error" in db_info:
+                welcome_msg += f"❌ **{db_name}**: {db_info['error']}\n"
+                continue
+                
+            welcome_msg += f"**{db_name}** ({db_info['file_name']})\n"
+            for table_name, table_info in db_info["tables"].items():
+                cols = ", ".join([f"`{col['name']}`" for col in table_info["columns"]])
+                welcome_msg += f"  • Table `{table_name}` : {cols}\n"
+            welcome_msg += "\n"
         
-        for db in schema_data.get("databases", []):
-            welcome_msg += f"\n**{db['name']}**\n"
-            for table in db.get("tables", []):
-                cols = ", ".join([f"`{col['name']}`" for col in table.get("columns", [])])
-                welcome_msg += f"  • Table `{table['name']}` : {cols}\n"
-        
-        welcome_msg += "\n### 🔧 Outils disponibles :\n"
+        welcome_msg += "###### 🔧 Outils disponibles :\n"
         welcome_msg += "- 🗄️ Requêtes SQL sur les bases\n"
         welcome_msg += "- 🎬 OMDb API pour infos films/séries détaillées\n"
         welcome_msg += "- 🌐 Recherche web pour actualités\n\n"
-        welcome_msg += "💬 **Posez votre question !**"
-        
-        st.session_state.chat_messages.append({
-            "role": "assistant",
-            "content": welcome_msg
-        })
-        st.session_state.welcome_shown = True
-        
-    except:
-        # Fallback if schema parsing fails
-        welcome_msg =  """
-                    **Salut !** Moi c'est **Albert**, le mage des données 🧙‍♂️
-                     
-                    Je vais t'aider à y voir clair dans tes données !
-
-                    Je suis prêt, pose-moi une question pour commencer 🧐
-                    """
-        st.session_state.chat_messages.append({
-            "role": "assistant",
-            "content": welcome_msg
-        })
-        st.session_state.welcome_shown = True
+        welcome_msg += "💬 **Vas-y, pose-moi une question !**"
+    
+    st.session_state.chat_messages.append({
+        "role": "assistant",
+        "content": welcome_msg
+    })
+    st.session_state.welcome_shown = True
 
 # Display chat history
 for message in st.session_state.chat_messages:
@@ -603,25 +543,22 @@ for message in st.session_state.chat_messages:
 
 # User input
 if prompt := st.chat_input("Ask your question..."):
-    # Add user message
     st.session_state.chat_messages.append({"role": "user", "content": prompt})
     st.session_state.agent_messages.append(HumanMessage(content=prompt))
     
-    # Keep only last 100 messages
     if len(st.session_state.agent_messages) > 100:
         st.session_state.agent_messages = st.session_state.agent_messages[-100:]
     
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Execute agent with real-time display
     with st.chat_message("assistant"):
         status_placeholder = st.empty()
         response_placeholder = st.empty()
         
         inputs = {
             "messages": st.session_state.agent_messages,
-            "schema": st.session_state.schema,
+            "db_catalog": st.session_state.db_catalog,
             "next_tool": "",
             "sources_used": [],
             "needs_clarification": False,
@@ -631,14 +568,12 @@ if prompt := st.chat_input("Ask your question..."):
         
         result = None
         
-        # Stream with status updates
         for step in app.stream(inputs, stream_mode="values"):
             result = step
             current_step = step.get("current_step", "")
             
-            # Update status based on step
             if current_step == "schema_loaded":
-                status_placeholder.info("📂 Loading schema...")
+                status_placeholder.info("📂 Loading catalog...")
             elif current_step == "question_clear":
                 status_placeholder.info("✅ Question analyzed...")
             elif current_step.startswith("calling_"):
@@ -654,7 +589,6 @@ if prompt := st.chat_input("Ask your question..."):
             elif current_step == "synthesis_complete":
                 status_placeholder.success("💬 Response ready!")
         
-        # Display final response
         if result:
             status_placeholder.empty()
             
@@ -663,13 +597,11 @@ if prompt := st.chat_input("Ask your question..."):
             
             response_placeholder.markdown(response_text)
             
-            # Save to history
             st.session_state.chat_messages.append({
                 "role": "assistant",
                 "content": response_text
             })
             
-            # Update agent messages and schema
             st.session_state.agent_messages = result["messages"]
-            st.session_state.schema = result.get("schema", st.session_state.schema)
+            st.session_state.db_catalog = result.get("db_catalog", st.session_state.db_catalog)
             st.session_state.sources = result.get("sources_used", [])
