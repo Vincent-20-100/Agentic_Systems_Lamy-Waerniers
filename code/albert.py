@@ -1,16 +1,10 @@
-################ PROBLEME DE CHEMIN DE BASE DE DONNEES A REGARDER ################
-
-"""
-SQL Agent with Memory, Sources, and Human-in-loop
-Launch: streamlit run app.py
-"""
-
 import streamlit as st
 import os
 import json
 import sqlite3
 import requests
 import re
+from pathlib import Path
 from typing import TypedDict, Annotated, Sequence, Literal
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
@@ -24,14 +18,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
-st.set_page_config(page_title="Agent SQL", page_icon="🤖", layout="wide")
-st.title("🤖 Agent SQL Netflix")
+st.set_page_config(page_title="Albert Query", page_icon="🧙‍♂️", layout="wide")
+st.title("🧙‍♂️ Albert Query")
 
 # API Keys from .env
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 OMDB_BASE_URL = "http://www.omdbapi.com/"
-DB_FOLDER_PATH = os.getenv("DB_FOLDER_PATH", "../data")
+DB_FOLDER_PATH = r"../data"
 
 if not OPENAI_API_KEY:
     st.error("❌ OPENAI_API_KEY missing in .env")
@@ -42,7 +36,7 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
 # === AGENT STATE ===
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    schema: str
+    db_catalog: dict
     next_tool: str
     sources_used: list  # Track sources
     needs_clarification: bool
@@ -66,10 +60,94 @@ def extract_urls(text: str) -> list:
     url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     return re.findall(url_pattern, text)
 
+def build_db_catalog(folder_path: str) -> dict:
+    """Construit un catalogue complet des databases avec chemins et schémas"""
+    catalog = {
+        "folder_path": folder_path,
+        "databases": {},
+        "error": None
+    }
+    
+    try:
+        db_files = [f for f in os.listdir(folder_path) 
+                   if f.endswith(('.db', '.sqlite', '.sqlite3'))]
+    except FileNotFoundError:
+        catalog["error"] = f"Folder {folder_path} not found"
+        return catalog
+
+    if not db_files:
+        catalog["error"] = "No SQLite databases found"
+        return catalog
+    
+    for db_file in db_files:
+        db_path_full = os.path.join(folder_path, db_file)
+        db_name = os.path.splitext(db_file)[0]  # nom sans extension
+        
+        try:
+            conn = sqlite3.connect(db_path_full)
+            cursor = conn.cursor()
+            
+            db_info = {
+                "file_name": db_file,
+                "full_path": db_path_full,
+                "tables": {}
+            }
+            
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+            
+            for (table_name,) in tables:
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns_info = cursor.fetchall()
+                
+                db_info["tables"][table_name] = {
+                    "columns": [
+                        {
+                            "name": col[1],
+                            "type": col[2],
+                        } for col in columns_info
+                    ],
+                }
+            
+            catalog["databases"][db_name] = db_info
+            conn.close()
+            
+        except Exception as e:
+            catalog["databases"][db_name] = {
+                "file_name": db_file,
+                "full_path": db_path_full,
+                "error": str(e)
+            }
+    
+    return catalog
+
+def format_catalog_for_llm(catalog: dict) -> str:
+    """Formate le catalogue pour le LLM"""
+    if catalog.get("error"):
+        return f"ERROR: {catalog['error']}"
+    
+    formatted = "📊 Available Databases:\n\n"
+    
+    for db_name, db_info in catalog["databases"].items():
+        if "error" in db_info:
+            formatted += f"❌ {db_name}: {db_info['error']}\n"
+            continue
+            
+        formatted += f"**Database: {db_name}** (file: {db_info['file_name']})\n"
+        
+        for table_name, table_info in db_info["tables"].items():
+            cols = ", ".join([f"{col['name']} ({col['type']})" 
+                            for col in table_info["columns"]])
+            formatted += f"  • Table `{table_name}`: {cols}\n"
+        
+        formatted += "\n"
+    
+    return formatted
+
 # === TOOLS ===
-@tool
-def get_db_schema(DB_FOLDER_PATH: str = "../data") -> str:
-    """Get schema of all SQLite databases in folder"""
+"""@tool
+def get_db_schema(DB_FOLDER_PATH: str = DB_FOLDER_PATH) -> str:
+    "Get schema of all SQLite databases in folder"
     result = {"databases": [], "error": None}
     
     try:
@@ -100,7 +178,7 @@ def get_db_schema(DB_FOLDER_PATH: str = "../data") -> str:
         except Exception as e:
             result["databases"].append({"name": db_file, "error": str(e)})
     
-    return json.dumps(result, indent=2)
+    return json.dumps(result, indent=2)"""
 
 @tool
 def execute_sql_query(query: str, db_path: str = None) -> str:
@@ -132,9 +210,55 @@ def web_search(query: str, num_results: int = 5) -> str:
         return json.dumps({"error": f"Web search error: {str(e)}"})
 
 @tool
-def omdb_api(by: str = "search", i: str = None, t: str = None, 
-             s: str = None, y: str = None, plot: str = "short") -> str:
-    """Query OMDb API for movie/series info"""
+def omdb_api(
+    by: Literal["id", "title", "search"] = "search",
+    i: str | None = None,      # IMDb ID (tt...)
+    t: str | None = None,      # Exact title
+    s: str | None = None,      # Search keyword
+    y: str | None = None,      # Year
+    plot: Literal["short", "full"] = "short",
+    type: Literal["movie", "series", "episode"] | None = None,
+    page: int | None = None,
+) -> str:
+    """
+    Query the OMDb API to get movie, series, or episode information.
+
+    Use exactly one of the following modes:
+
+    1. **By ID**: `by="id"`, provide `i="tt1375666"`
+    2. **By Title**: `by="title"`, provide `t="Inception"`
+    3. **By Search**: `by="search"`, provide `s="joker"`, optionally `y`, `type`, `page`
+
+    Parameters
+    ----------
+    by : "id" | "title" | "search"
+        Query mode. Default: "search"
+    i : str, optional
+        IMDb ID (e.g., "tt1375666"). Required if by="id"
+    t : str, optional
+        Exact title. Required if by="title"
+    s : str, optional
+        Search keyword. Required if by="search"
+    y : str, optional
+        Release year (4 digits)
+    plot : "short" | "full"
+        Plot summary length. Default: "short"
+    type : "movie" | "series" | "episode", optional
+        Filter results by type
+    page : int, optional
+        Page number for search results (1–100)
+
+    Returns
+    -------
+    str
+        JSON string with movie data (or error message)
+
+    Examples
+    --------
+    >>> omdb_api(by="title", t="Inception", plot="full")
+    >>> omdb_api(by="search", s="batman", y="2008", type="movie")
+    >>> omdb_api(by="id", i="tt1375666")
+    """
     if not OMDB_API_KEY:
         return json.dumps({"error": "OMDB_API_KEY missing"})
     
@@ -166,12 +290,20 @@ llm_with_tools = llm.bind_tools(tools)
 # === WORKFLOW NODES ===
 
 def get_schema_node(state: AgentState) -> dict:
-    """Load database schema"""
-    schema = get_db_schema.invoke({})
+    """Charge le catalogue complet des databases"""
+    catalog = build_db_catalog(DB_FOLDER_PATH)
+    
+    if catalog.get("error"):
+        return {
+            "db_catalog": catalog,
+            "current_step": "schema_error",
+            "messages": [AIMessage(content=f"❌ Error loading databases: {catalog['error']}")]
+        }
+    
     return {
-        "schema": schema,
+        "db_catalog": catalog,
         "current_step": "schema_loaded",
-        "messages": [AIMessage(content="✅ Schema loaded")]
+        "messages": [AIMessage(content="✅ Database catalog loaded")]
     }
 
 def clarify_question_node(state: AgentState) -> dict:
@@ -186,10 +318,12 @@ def clarify_question_node(state: AgentState) -> dict:
             "messages": [AIMessage(content="✅ Thanks for clarification")]
         }
     
+    catalog_info = format_catalog_for_llm(state["db_catalog"])
+    
     prompt = f"""Analyze this question: "{user_question}"
 
 Available context:
-- Database netflix.db (movies, series, years, ratings)
+{catalog_info}
 - OMDb API (detailed movie/series info)
 - Web search (news, recent releases)
 
@@ -228,7 +362,6 @@ Respond ONLY in JSON:
                 "messages": [AIMessage(content="✅ Question clear, analyzing...")]
             }
     except:
-        # If JSON parsing fails, assume clear
         return {
             "needs_clarification": False,
             "current_step": "question_clear",
@@ -300,8 +433,14 @@ def tool_executor_node(state: AgentState) -> dict:
         # Track source
         source = ""
         if tool_name == "execute_sql_query":
-            source = f"🗄️ Database: [{os.path.basename(DB_FOLDER_PATH)}](file://{os.path.abspath(DB_FOLDER_PATH)})"
+            tool_args["state_catalog"] = state["db_catalog"]
+            result = execute_sql_query.invoke(tool_args)
+            db_name = tool_args.get("db_name", "unknown")
+            db_info = state["db_catalog"]["databases"].get(db_name, {})
+            db_path = db_info.get("full_path", "unknown")
+            source = f"🗄️ Database: {db_name} [{db_path}]"
         elif tool_name == "omdb_api":
+            result = omdb_api.invoke(tool_args)
             title = tool_args.get('t', tool_args.get('i', 'unknown'))
             url = f"{OMDB_BASE_URL}?t={title.replace(' ', '+')}&apikey=***"
             source = f"🎬 OMDb API: [{title}]({url})"
@@ -414,7 +553,7 @@ if "welcome_shown" not in st.session_state:
 # Show welcome message on first load
 if not st.session_state.welcome_shown:
     # Load schema to display available resources
-    schema_result = get_db_schema.invoke({})
+    schema_result = get_schema_node(AgentState())
     st.session_state.schema = schema_result
     
     try:
@@ -444,7 +583,13 @@ if not st.session_state.welcome_shown:
         
     except:
         # Fallback if schema parsing fails
-        welcome_msg = "👋 **Bienvenue !** Je suis prêt à vous aider avec la base Netflix. Posez votre question !"
+        welcome_msg =  """
+                    **Salut !** Moi c'est **Albert**, le mage des données 🧙‍♂️
+                     
+                    Je vais t'aider à y voir clair dans tes données !
+
+                    Je suis prêt, pose-moi une question pour commencer 🧐
+                    """
         st.session_state.chat_messages.append({
             "role": "assistant",
             "content": welcome_msg
