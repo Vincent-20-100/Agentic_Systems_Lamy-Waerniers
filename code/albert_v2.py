@@ -507,36 +507,70 @@ def synthesize_node(state: AgentState) -> dict:
     user_messages = [m for m in state["messages"] if isinstance(m, HumanMessage)]
     user_question = user_messages[-1].content if user_messages else ""
     
+    # Get all collected data explicitly from state
+    sql_result = state.get("sql_result", "[]")
+    omdb_result = state.get("omdb_result", "{}")
+    web_result = state.get("web_result", "{}")
+    
+    # Parse results to check what we have
+    has_sql_data = False
+    has_omdb_data = False
+    has_web_data = False
+    
+    try:
+        sql_data = json.loads(sql_result)
+        has_sql_data = isinstance(sql_data, list) and len(sql_data) > 0 and "error" not in str(sql_data)
+    except:
+        pass
+    
+    try:
+        omdb_data = json.loads(omdb_result)
+        has_omdb_data = omdb_data and omdb_data.get("Response") != "False"
+    except:
+        pass
+    
+    try:
+        web_data = json.loads(web_result)
+        has_web_data = bool(web_data) and "error" not in str(web_data)
+    except:
+        pass
+    
     prompt = f"""You are Albert, a friendly data assistant that helps users understand their data.
 
 User's original question: "{user_question}"
 
-You have access to all the data collected in the conversation history.
+Available data:
+---
+SQL Database Results: 
+{sql_result if has_sql_data else "No data found in database"}
+
+---
+OMDB API Results:
+{omdb_result if has_omdb_data else "No OMDB data available"}
+
+---
+WEB Results:
+{web_result if has_web_data else "No WEB data available"}
+
+---
+
 
 Your task:
 1. Provide a clear, concise answer in French
-2. Use natural language, be conversational
-3. If you have data, present it in a user-friendly way
-4. If data is missing, explain what's not available
-5. Always add sources at the end
+2. Use natural language, be conversational and friendly
+3. If you have data from SQL or OMDB, present it naturally
+4. If no data is available, explain politely what's missing
+5. Don't mention technical terms like "SQL" or "API" - just answer naturally
+6. Always add sources at the end
 
 Format your response naturally, then add at the END:
 
 **📚 Sources:**
 {sources_text}
 
-Be helpful and friendly! Don't mention "based on the data" or technical details."""
+Be helpful, friendly, and human! Answer as if you're explaining to a friend."""
     
-    # Include only relevant messages (skip intermediate processing)
-    relevant_messages = [m for m in state["messages"] 
-                        if "SQL Result" in m.content or "OMDB Data" in m.content or "Web Results" in m.content]
-    
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": user_question}
-    ] + [{"role": "assistant", "content": m.content} for m in relevant_messages[-3:]]  # Last 3 results only
-    
-    response = llm.invoke(messages)
+    response = llm.invoke(prompt)
     
     return {
         "messages": state["messages"] + [response],
