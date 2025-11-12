@@ -1,607 +1,462 @@
-"""
-SQL Agent with Memory, Sources, and Human-in-loop
-Launch: streamlit run app.py
-"""
-
-import streamlit as st
-import os
-import json
-import sqlite3
-import requests
-import re
-from typing import TypedDict, Annotated, Sequence, Literal
-from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
-from langchain_openai import ChatOpenAI
-from langchain_community.tools import DuckDuckGoSearchResults
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from dotenv import load_dotenv
-import pathlib
-
-# Load environment variables
-load_dotenv()
-
-# Configuration
-st.set_page_config(page_title="Albert Query", page_icon="🧙‍♂️", layout="wide")
-#st.title("🧙‍♂️ Albert Query")
-
-# API Keys from .env
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OMDB_API_KEY = os.getenv("OMDB_API_KEY")
-OMDB_BASE_URL = "http://www.omdbapi.com/"
-
-# Chemin absolu vers les databases
-SCRIPT_DIR = pathlib.Path(__file__).parent.absolute()
-DB_FOLDER_PATH = str(SCRIPT_DIR.parent / "data")
-
-if not OPENAI_API_KEY:
-    st.error("❌ OPENAI_API_KEY missing in .env")
-    st.stop()
-
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
-
-# === AGENT STATE ===
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    db_catalog: dict
-    next_tool: str
-    sources_used: list
-    needs_clarification: bool
-    clarification_question: str
-    current_step: str
-
-# === HELPER FUNCTIONS ===
-def clean_json(text: str) -> str:
-    """Clean JSON from markdown formatting"""
-    text = text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    return text.strip()
-
-def extract_urls(text: str) -> list:
-    """Extract URLs from text"""
-    url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-    return re.findall(url_pattern, text)
-
-def build_db_catalog(folder_path: str) -> dict:
-    """🆕 Construit un catalogue complet des databases avec chemins et schémas"""
-    catalog = {
-        "folder_path": folder_path,
-        "databases": {},
-        "error": None
-    }
-    
-    try:
-        db_files = [f for f in os.listdir(folder_path) 
-                   if f.endswith(('.db', '.sqlite', '.sqlite3'))]
-    except FileNotFoundError:
-        catalog["error"] = f"Folder {folder_path} not found"
-        return catalog
-
-    if not db_files:
-        catalog["error"] = "No SQLite databases found"
-        return catalog
-    
-    for db_file in db_files:
-        db_path_full = os.path.join(folder_path, db_file)
-        db_name = os.path.splitext(db_file)[0]  # nom sans extension
-        
-        try:
-            conn = sqlite3.connect(db_path_full)
-            cursor = conn.cursor()
-            
-            db_info = {
-                "file_name": db_file,
-                "full_path": db_path_full,
-                "tables": {}
-            }
-            
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            
-            for (table_name,) in tables:
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns_info = cursor.fetchall()
-                
-                db_info["tables"][table_name] = {
-                    "columns": [
-                        {
-                            "name": col[1],
-                            "type": col[2],
-                            "not_null": bool(col[3]),
-                            "primary_key": bool(col[5])
-                        } for col in columns_info
-                    ],
-                    "column_names": [col[1] for col in columns_info]
-                }
-            
-            catalog["databases"][db_name] = db_info
-            conn.close()
-            
-        except Exception as e:
-            catalog["databases"][db_name] = {
-                "file_name": db_file,
-                "full_path": db_path_full,
-                "error": str(e)
-            }
-    
-    return catalog
-
-def format_catalog_for_llm(catalog: dict) -> str:
-    """🆕 Formate le catalogue pour le LLM"""
-    if catalog.get("error"):
-        return f"ERROR: {catalog['error']}"
-    
-    formatted = "📊 Available Databases:\n\n"
-    
-    for db_name, db_info in catalog["databases"].items():
-        if "error" in db_info:
-            formatted += f"❌ {db_name}: {db_info['error']}\n"
-            continue
-            
-        formatted += f"**Database: {db_name}** (file: {db_info['file_name']})\n"
-        
-        for table_name, table_info in db_info["tables"].items():
-            cols = ", ".join([f"{col['name']} ({col['type']})" 
-                            for col in table_info["columns"]])
-            formatted += f"  • Table `{table_name}`: {cols}\n"
-        
-        formatted += "\n"
-    
-    return formatted
-
-# === TOOLS ===
-@tool
-def execute_sql_query(query: str, db_name: str, state_catalog: dict) -> str:
-    """🆕 Execute SQL query using catalog state"""
-    catalog = state_catalog
-    
-    # Vérifier que la database existe dans le catalogue
-    if db_name not in catalog["databases"]:
-        available = ", ".join(catalog["databases"].keys())
-        return json.dumps({
-            "error": f"Database '{db_name}' not found in catalog. Available: {available}"
-        })
-    
-    db_info = catalog["databases"][db_name]
-    
-    if "error" in db_info:
-        return json.dumps({"error": f"Database error: {db_info['error']}"})
-    
-    db_path = db_info["full_path"]
-    
-    if not os.path.exists(db_path):
-        return json.dumps({"error": f"Database file not found: {db_path}"})
-    
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        result = [dict(zip(columns, row)) for row in rows]
-        conn.close()
-        return json.dumps(result, indent=2, default=str)
-    except Exception as e:
-        return json.dumps({"error": f"SQL Error: {str(e)}"})
-
-@tool
-def web_search(query: str, num_results: int = 5) -> str:
-    """Web search via DuckDuckGo"""
-    try:
-        search = DuckDuckGoSearchResults(num_results=num_results)
-        return search.run(query)
-    except Exception as e:
-        return json.dumps({"error": f"Web search error: {str(e)}"})
-
-@tool
-def omdb_api(by: str = "search", i: str = None, t: str = None, 
-             s: str = None, y: str = None, plot: str = "short") -> str:
-    """Query OMDb API for movie/series info"""
-    if not OMDB_API_KEY:
-        return json.dumps({"error": "OMDB_API_KEY missing"})
-    
-    params = {"apikey": OMDB_API_KEY, "plot": plot}
-    
-    if by == "id" and i:
-        params["i"] = i
-    elif by == "title" and t:
-        params["t"] = t
-    elif by == "search" and s:
-        params["s"] = s
-    else:
-        return json.dumps({"error": "Missing parameters (i/t/s depending on 'by')"})
-    
-    if y:
-        params["y"] = y
-    
-    try:
-        response = requests.get(OMDB_BASE_URL, params=params, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.RequestException as e:
-        return json.dumps({"error": f"OMDb API error: {str(e)}"})
-
-# Bind tools to LLM (sans execute_sql_query pour l'instant)
-tools = [web_search, omdb_api]
-llm_with_tools = llm.bind_tools(tools)
-
-# === WORKFLOW NODES ===
-
-def get_schema_node(state: AgentState) -> dict:
-    """🆕 Charge le catalogue complet des databases"""
-    catalog = build_db_catalog(DB_FOLDER_PATH)
-    
-    if catalog.get("error"):
-        return {
-            "db_catalog": catalog,
-            "current_step": "schema_error",
-            "messages": [AIMessage(content=f"❌ Error loading databases: {catalog['error']}")]
-        }
-    
-    return {
-        "db_catalog": catalog,
-        "current_step": "schema_loaded",
-        "messages": [AIMessage(content="✅ Database catalog loaded")]
-    }
-
-def clarify_question_node(state: AgentState) -> dict:
-    """Analyze question and ask for clarification if needed"""
-    user_question = state["messages"][-1].content
-    
-    # Skip clarification if it's a response to a previous clarification
-    if len(state["messages"]) > 2 and state.get("needs_clarification"):
-        return {
-            "needs_clarification": False,
-            "current_step": "clarification_answered",
-            "messages": [AIMessage(content="✅ Thanks for clarification")]
-        }
-    
-    catalog_info = format_catalog_for_llm(state["db_catalog"])
-    
-    prompt = f"""Analyze this question: "{user_question}"
-
-Available context:
-{catalog_info}
-- OMDb API (detailed movie/series info)
-- Web search (news, recent releases)
-
-Is the question:
-- CLEAR: can answer directly
-- AMBIGUOUS: need clarification
-
-Examples of AMBIGUOUS:
-- "a movie" → which movie?
-- "when released?" → which title?
-- "good series" → genre? year?
-
-Respond ONLY in JSON:
-{{
-  "status": "clear" or "ambiguous",
-  "clarification": "Question to ask user" (if ambiguous),
-  "reasoning": "Why it's ambiguous"
-}}"""
-    
-    response = llm.invoke(prompt)
-    
-    try:
-        decision = json.loads(clean_json(response.content))
-        
-        if decision["status"] == "ambiguous":
-            return {
-                "needs_clarification": True,
-                "clarification_question": decision["clarification"],
-                "current_step": "waiting_clarification",
-                "messages": [AIMessage(content=decision["clarification"])]
-            }
-        else:
-            return {
-                "needs_clarification": False,
-                "current_step": "question_clear",
-                "messages": [AIMessage(content="✅ Question clear, analyzing...")]
-            }
-    except:
-        return {
-            "needs_clarification": False,
-            "current_step": "question_clear",
-            "messages": [AIMessage(content="✅ Analyzing...")]
-        }
-
-def chief_agent_node(state: AgentState) -> dict:
-    """Chief analyzes and calls appropriate tool with catalog context"""
-    catalog_info = format_catalog_for_llm(state["db_catalog"])
-    
-    prompt = f"""You are a SQL/data assistant. You have access to:
-
-1. **execute_sql_query**: Query databases
-   - You MUST provide: query (SQL), db_path (full path from catalog)
-   - Use the catalog below to know which db_path and tables to use
-
-2. **web_search**: General web searches
-
-3. **omdb_api**: Detailed movie/series info
-
-{catalog_info}
-
-⚠️ IMPORTANT for SQL queries:
-- Always specify the correct 'db_path' (use full_path from catalog)
-- Refer to the catalog above for exact table and column names
-- Write valid SQLite syntax
-
-Analyze the user request and choose THE MOST appropriate tool."""
-    
-    messages = [{"role": "system", "content": prompt}] + [
-        {"role": m.type, "content": m.content} for m in state["messages"]
-    ]
-    
-    response = llm_with_tools.invoke(messages)
-    
-    if response.tool_calls:
-        tool_name = response.tool_calls[0]["name"]
-        next_tool = {
-            "execute_sql_query": "sql",
-            "web_search": "web",
-            "omdb_api": "omdb"
-        }.get(tool_name, "none")
-        
-        return {
-            "next_tool": next_tool,
-            "current_step": f"calling_{tool_name}",
-            "messages": [response]
-        }
-    else:
-        return {
-            "next_tool": "none",
-            "current_step": "direct_answer",
-            "messages": [response]
-        }
-
-def tool_executor_node(state: AgentState) -> dict:
-    """Execute the chosen tool and track sources"""
-    last_message = state["messages"][-1]
-    
-    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-        return {"messages": [AIMessage(content="⚠️ No tool to execute")]}
-    
-    tool_call = last_message.tool_calls[0]
-    tool_name = tool_call["name"]
-    tool_args = tool_call["args"]
-    
-    tool_map = {
-        "execute_sql_query": execute_sql_query,
-        "web_search": web_search,
-        "omdb_api": omdb_api
-    }
-    
-    tool_func = tool_map.get(tool_name)
-    if not tool_func:
-        return {"messages": [AIMessage(content=f"⚠️ Unknown tool {tool_name}")]}
-    
-    try:
-        result = tool_func.invoke(tool_args)
-        
-        # Track source
-        source = ""
-        if tool_name == "execute_sql_query":
-            db_path = tool_args.get("db_path", "unknown")
-            source = f"🗄️ Database: [{db_path}]"
-        elif tool_name == "omdb_api":
-            title = tool_args.get('t', tool_args.get('i', 'unknown'))
-            url = f"{OMDB_BASE_URL}?t={title.replace(' ', '+')}&apikey=***"
-            source = f"🎬 OMDb API: [{title}]({url})"
-        elif tool_name == "web_search":
-            urls = extract_urls(result)
-            if urls:
-                source = f"🌐 Web: [DuckDuckGo]({urls[0]})"
-            else:
-                source = "🌐 Web: DuckDuckGo Search"
-        
-        return {
-            "messages": [AIMessage(content=f"📊 Result:\n{result}")],
-            "sources_used": state.get("sources_used", []) + [source],
-            "current_step": f"{tool_name}_completed"
-        }
-    except Exception as e:
-        return {"messages": [AIMessage(content=f"❌ Error {tool_name}: {str(e)}")]}
-
-def synthesize_node(state: AgentState) -> dict:
-    """Synthesize results and add sources"""
-    sources = state.get("sources_used", [])
-    sources_text = "\n".join([f"- {s}" for s in sources]) if sources else ""
-    
-    prompt = f"""You are an assistant that synthesizes results.
-Provide a clear, concise answer in French to the user.
-Use the data available in the message history.
-
-At the END of your response, add a section:
-
-**📚 Sources:**
-{sources_text}
-
-Be natural, don't mention "based on the data" or similar."""
-    
-    messages = [{"role": "system", "content": prompt}] + [
-        {"role": m.type, "content": m.content} for m in state["messages"]
-    ]
-    
-    response = llm.invoke(messages)
-    return {
-        "messages": [response],
-        "current_step": "synthesis_complete"
-    }
-
-# === ROUTING ===
-
-def route_after_clarify(state: AgentState) -> Literal["wait_user", "chief_agent"]:
-    """Route based on clarification need"""
-    return "wait_user" if state.get("needs_clarification") else "chief_agent"
-
-def route_after_chief(state: AgentState) -> Literal["tool_executor", "synthesize"]:
-    """Route based on tool choice"""
-    return "tool_executor" if state["next_tool"] != "none" else "synthesize"
-
-# === BUILD GRAPH ===
-
-@st.cache_resource
-def build_agent():
-    """Build and compile the LangGraph workflow"""
-    workflow = StateGraph(AgentState)
-    
-    workflow.add_node("get_schema", get_schema_node)
-    workflow.add_node("clarify_question", clarify_question_node)
-    workflow.add_node("chief_agent", chief_agent_node)
-    workflow.add_node("tool_executor", tool_executor_node)
-    workflow.add_node("synthesize", synthesize_node)
-    workflow.add_node("wait_user", lambda state: state)
-    
-    workflow.add_edge(START, "get_schema")
-    workflow.add_edge("get_schema", "clarify_question")
-    
-    workflow.add_conditional_edges(
-        "clarify_question",
-        route_after_clarify,
-        {"wait_user": END, "chief_agent": "chief_agent"}
-    )
-    
-    workflow.add_conditional_edges(
-        "chief_agent",
-        route_after_chief,
-        {"tool_executor": "tool_executor", "synthesize": "synthesize"}
-    )
-    
-    workflow.add_edge("tool_executor", "synthesize")
-    workflow.add_edge("synthesize", END)
-    
-    return workflow.compile()
-
-app = build_agent()
-
-# === STREAMLIT INTERFACE ===
-
-# Initialize session state
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-
-if "agent_messages" not in st.session_state:
-    st.session_state.agent_messages = []
-
-if "db_catalog" not in st.session_state:
-    st.session_state.db_catalog = {}
-
-if "db_catalog" not in st.session_state:
-    st.session_state.db_catalog = {}
-
-if "sources" not in st.session_state:
-    st.session_state.sources = []
-
-if "welcome_shown" not in st.session_state:
-    st.session_state.welcome_shown = False
-
-# Show welcome message on first load
-if not st.session_state.welcome_shown:
-    catalog = build_db_catalog(DB_FOLDER_PATH)
-    st.session_state.db_catalog = catalog
-    
-    if catalog.get("error"):
-        welcome_msg = f"⚠️ **Erreur de chargement:** {catalog['error']}"
-    else:
-        welcome_msg = "##### 👋 **Salut !** Moi c'est **Albert**,\n\n###### 🧐 Je vais t'aider à y voir clair dans tes données !\n\n"
-        welcome_msg += "\n\n ###### 📊 Bases de données disponibles :\n\n"
-        
-        for db_name, db_info in catalog["databases"].items():
-            if "error" in db_info:
-                welcome_msg += f"❌ **{db_name}**: {db_info['error']}\n"
-                continue
-                
-            welcome_msg += f"**{db_name}** ({db_info['file_name']})\n"
-            for table_name, table_info in db_info["tables"].items():
-                cols = ", ".join([f"`{col['name']}`" for col in table_info["columns"]])
-                welcome_msg += f"  • Table `{table_name}` : {cols}\n"
-            welcome_msg += "\n"
-        
-        welcome_msg += "###### 🔧 Outils disponibles :\n"
-        welcome_msg += "- 🗄️ Requêtes SQL sur les bases\n"
-        welcome_msg += "- 🎬 OMDb API pour infos films/séries détaillées\n"
-        welcome_msg += "- 🌐 Recherche web pour actualités\n\n"
-        welcome_msg += "💬 **Vas-y, pose-moi une question !**"
-    
-    st.session_state.chat_messages.append({
-        "role": "assistant",
-        "content": welcome_msg
-    })
-    st.session_state.welcome_shown = True
-
-# Display chat history
-for message in st.session_state.chat_messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# User input
-if prompt := st.chat_input("Ask your question..."):
-    st.session_state.chat_messages.append({"role": "user", "content": prompt})
-    st.session_state.agent_messages.append(HumanMessage(content=prompt))
-    
-    if len(st.session_state.agent_messages) > 100:
-        st.session_state.agent_messages = st.session_state.agent_messages[-100:]
-    
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    with st.chat_message("assistant"):
-        status_placeholder = st.empty()
-        response_placeholder = st.empty()
-        
-        inputs = {
-            "messages": st.session_state.agent_messages,
-            "db_catalog": st.session_state.db_catalog,
-            "next_tool": "",
-            "sources_used": [],
-            "needs_clarification": False,
-            "clarification_question": "",
-            "current_step": ""
-        }
-        
-        result = None
-        
-        for step in app.stream(inputs, stream_mode="values"):
-            result = step
-            current_step = step.get("current_step", "")
-            
-            if current_step == "schema_loaded":
-                status_placeholder.info("📂 Loading catalog...")
-            elif current_step == "question_clear":
-                status_placeholder.info("✅ Question analyzed...")
-            elif current_step.startswith("calling_"):
-                tool = current_step.replace("calling_", "")
-                if tool == "execute_sql_query":
-                    status_placeholder.info("🗄️ Querying database...")
-                elif tool == "web_search":
-                    status_placeholder.info("🌐 Searching the web...")
-                elif tool == "omdb_api":
-                    status_placeholder.info("🎬 Calling OMDb API...")
-            elif current_step.endswith("_completed"):
-                status_placeholder.success("✅ Data retrieved!")
-            elif current_step == "synthesis_complete":
-                status_placeholder.success("💬 Response ready!")
-        
-        if result:
-            status_placeholder.empty()
-            
-            final_message = result["messages"][-1]
-            response_text = final_message.content
-            
-            response_placeholder.markdown(response_text)
-            
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": response_text
-            })
-            
-            st.session_state.agent_messages = result["messages"]
-            st.session_state.db_catalog = result.get("db_catalog", st.session_state.db_catalog)
-            st.session_state.sources = result.get("sources_used", [])
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "dd657bbb",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\"\"\"\n",
+    "Interface Streamlit pour l'Agent SQL avec historique et chat interactif\n",
+    "Lancer avec : streamlit run app.py\n",
+    "\"\"\"\n",
+    "\n",
+    "import streamlit as st\n",
+    "import os\n",
+    "import json\n",
+    "import sqlite3\n",
+    "import requests\n",
+    "from typing import TypedDict, Annotated, Sequence, Literal\n",
+    "from langchain_core.tools import tool\n",
+    "from langchain_core.messages import AIMessage, HumanMessage, BaseMessage\n",
+    "from langchain_openai import ChatOpenAI\n",
+    "from langchain_community.tools import DuckDuckGoSearchResults\n",
+    "from langgraph.graph import StateGraph, START, END\n",
+    "from langgraph.graph.message import add_messages\n",
+    "\n",
+    "# === CONFIGURATION PAGE ===\n",
+    "st.set_page_config(\n",
+    "    page_title=\"🎬 Agent SQL Netflix\",\n",
+    "    page_icon=\"🤖\",\n",
+    "    layout=\"wide\",\n",
+    "    initial_sidebar_state=\"expanded\"\n",
+    ")\n",
+    "\n",
+    "# === STYLE CSS ===\n",
+    "st.markdown(\"\"\"\n",
+    "<style>\n",
+    "    .stChatMessage {\n",
+    "        padding: 1rem;\n",
+    "        border-radius: 0.5rem;\n",
+    "        margin-bottom: 1rem;\n",
+    "    }\n",
+    "    .user-message {\n",
+    "        background-color: #e3f2fd;\n",
+    "    }\n",
+    "    .assistant-message {\n",
+    "        background-color: #f5f5f5;\n",
+    "    }\n",
+    "    .tool-message {\n",
+    "        background-color: #fff3e0;\n",
+    "        font-family: monospace;\n",
+    "        font-size: 0.9em;\n",
+    "    }\n",
+    "</style>\n",
+    "\"\"\", unsafe_allow_html=True)\n",
+    "\n",
+    "# === CONFIGURATION API (Sidebar) ===\n",
+    "with st.sidebar:\n",
+    "    st.title(\"⚙️ Configuration\")\n",
+    "    \n",
+    "    openai_key = st.text_input(\n",
+    "        \"🔑 OpenAI API Key\",\n",
+    "        type=\"password\",\n",
+    "        value=os.getenv(\"OPENAI_API_KEY\", \"\"),\n",
+    "        help=\"Votre clé API OpenAI\"\n",
+    "    )\n",
+    "    \n",
+    "    omdb_key = st.text_input(\n",
+    "        \"🎬 OMDb API Key\",\n",
+    "        type=\"password\",\n",
+    "        value=os.getenv(\"OMDB_API_KEY\", \"\"),\n",
+    "        help=\"Clé API pour Open Movie Database (optionnel)\"\n",
+    "    )\n",
+    "    \n",
+    "    db_path = st.text_input(\n",
+    "        \"📁 Chemin vers la base\",\n",
+    "        value=\"../data/netflix.db\",\n",
+    "        help=\"Chemin vers votre fichier netflix.db\"\n",
+    "    )\n",
+    "    \n",
+    "    st.divider()\n",
+    "    \n",
+    "    # Bouton pour effacer l'historique\n",
+    "    if st.button(\"🗑️ Effacer l'historique\", use_container_width=True):\n",
+    "        st.session_state.chat_history = []\n",
+    "        st.session_state.agent_state = None\n",
+    "        st.rerun()\n",
+    "    \n",
+    "    st.divider()\n",
+    "    \n",
+    "    # Informations\n",
+    "    st.markdown(\"### 📊 Outils disponibles\")\n",
+    "    st.markdown(\"\"\"\n",
+    "    - **SQL Query** : Interroger netflix.db\n",
+    "    - **Web Search** : Recherche sur le web\n",
+    "    - **OMDb API** : Infos films/séries\n",
+    "    \"\"\")\n",
+    "    \n",
+    "    # Statut de la base\n",
+    "    st.divider()\n",
+    "    if os.path.exists(db_path):\n",
+    "        st.success(f\"✅ Base trouvée : `{os.path.basename(db_path)}`\")\n",
+    "    else:\n",
+    "        st.error(f\"❌ Base introuvable : `{db_path}`\")\n",
+    "\n",
+    "# === VÉRIFICATION CLÉS ===\n",
+    "if not openai_key:\n",
+    "    st.warning(\"⚠️ Veuillez entrer votre clé OpenAI dans la sidebar\")\n",
+    "    st.stop()\n",
+    "\n",
+    "# === CONFIGURATION LLM ===\n",
+    "OMDB_BASE_URL = \"http://www.omdbapi.com/\"\n",
+    "llm = ChatOpenAI(model=\"gpt-4o-mini\", temperature=0, api_key=openai_key)\n",
+    "\n",
+    "# === ÉTAT AGENT ===\n",
+    "class AgentState(TypedDict):\n",
+    "    messages: Annotated[Sequence[BaseMessage], add_messages]\n",
+    "    schema: str\n",
+    "    next_tool: str\n",
+    "\n",
+    "# === OUTILS ===\n",
+    "@tool\n",
+    "def get_db_schema(db_folder: str = \"../data\") -> str:\n",
+    "    \"\"\"Récupère le schéma de toutes les bases SQLite du dossier.\"\"\"\n",
+    "    result = {\"databases\": [], \"error\": None}\n",
+    "    \n",
+    "    try:\n",
+    "        db_files = [f for f in os.listdir(db_folder) if f.endswith(('.db', '.sqlite', '.sqlite3'))]\n",
+    "    except FileNotFoundError:\n",
+    "        return json.dumps({\"error\": f\"Dossier {db_folder} introuvable\"})\n",
+    "    \n",
+    "    if not db_files:\n",
+    "        return json.dumps({\"error\": \"Aucune base SQLite trouvée\"})\n",
+    "    \n",
+    "    for db_file in db_files:\n",
+    "        db_path_full = os.path.join(db_folder, db_file)\n",
+    "        try:\n",
+    "            conn = sqlite3.connect(db_path_full)\n",
+    "            cursor = conn.cursor()\n",
+    "            \n",
+    "            database = {\"name\": db_file, \"tables\": []}\n",
+    "            cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table';\")\n",
+    "            tables = cursor.fetchall()\n",
+    "            \n",
+    "            for (table_name,) in tables:\n",
+    "                cursor.execute(f\"PRAGMA table_info({table_name})\")\n",
+    "                columns = [{\"name\": col[1], \"type\": col[2]} for col in cursor.fetchall()]\n",
+    "                database[\"tables\"].append({\"name\": table_name, \"columns\": columns})\n",
+    "            \n",
+    "            result[\"databases\"].append(database)\n",
+    "            conn.close()\n",
+    "        except Exception as e:\n",
+    "            result[\"databases\"].append({\"name\": db_file, \"error\": str(e)})\n",
+    "    \n",
+    "    return json.dumps(result, indent=2)\n",
+    "\n",
+    "@tool\n",
+    "def execute_sql_query(query: str, db_file_path: str = None) -> str:\n",
+    "    \"\"\"Exécute une requête SQL sur la base netflix.\"\"\"\n",
+    "    # Utiliser le chemin de la sidebar\n",
+    "    path = db_file_path or db_path\n",
+    "    \n",
+    "    if not os.path.exists(path):\n",
+    "        return json.dumps({\"error\": f\"Base {path} introuvable\"})\n",
+    "    \n",
+    "    try:\n",
+    "        conn = sqlite3.connect(path)\n",
+    "        cursor = conn.cursor()\n",
+    "        cursor.execute(query)\n",
+    "        rows = cursor.fetchall()\n",
+    "        columns = [desc[0] for desc in cursor.description]\n",
+    "        result = [dict(zip(columns, row)) for row in rows]\n",
+    "        conn.close()\n",
+    "        return json.dumps(result, indent=2, default=str)\n",
+    "    except Exception as e:\n",
+    "        return json.dumps({\"error\": f\"Erreur SQL: {str(e)}\"})\n",
+    "\n",
+    "@tool\n",
+    "def web_search(query: str, num_results: int = 5) -> str:\n",
+    "    \"\"\"Recherche web via DuckDuckGo.\"\"\"\n",
+    "    try:\n",
+    "        search = DuckDuckGoSearchResults(num_results=num_results)\n",
+    "        return search.run(query)\n",
+    "    except Exception as e:\n",
+    "        return json.dumps({\"error\": f\"Erreur web search: {str(e)}\"})\n",
+    "\n",
+    "@tool\n",
+    "def omdb_api(by: str = \"search\", i: str = None, t: str = None, \n",
+    "             s: str = None, y: str = None, plot: str = \"short\") -> str:\n",
+    "    \"\"\"Interroge l'API OMDb pour infos films/séries.\"\"\"\n",
+    "    if not omdb_key:\n",
+    "        return json.dumps({\"error\": \"Clé OMDB_API_KEY manquante\"})\n",
+    "    \n",
+    "    params = {\"apikey\": omdb_key, \"plot\": plot}\n",
+    "    \n",
+    "    if by == \"id\" and i:\n",
+    "        params[\"i\"] = i\n",
+    "    elif by == \"title\" and t:\n",
+    "        params[\"t\"] = t\n",
+    "    elif by == \"search\" and s:\n",
+    "        params[\"s\"] = s\n",
+    "    else:\n",
+    "        return json.dumps({\"error\": \"Paramètres manquants (i/t/s selon 'by')\"})\n",
+    "    \n",
+    "    if y:\n",
+    "        params[\"y\"] = y\n",
+    "    \n",
+    "    try:\n",
+    "        response = requests.get(OMDB_BASE_URL, params=params, timeout=10)\n",
+    "        response.raise_for_status()\n",
+    "        return response.text\n",
+    "    except requests.exceptions.RequestException as e:\n",
+    "        return json.dumps({\"error\": f\"Erreur API OMDb: {str(e)}\"})\n",
+    "\n",
+    "# === BINDING OUTILS ===\n",
+    "tools = [execute_sql_query, web_search, omdb_api]\n",
+    "llm_with_tools = llm.bind_tools(tools)\n",
+    "\n",
+    "# === NŒUDS ===\n",
+    "def get_schema_node(state: AgentState) -> dict:\n",
+    "    \"\"\"Charge le schéma de la base de données.\"\"\"\n",
+    "    folder = os.path.dirname(db_path) or \"../data\"\n",
+    "    schema = get_db_schema.invoke({\"db_folder\": folder})\n",
+    "    return {\n",
+    "        \"schema\": schema,\n",
+    "        \"messages\": [AIMessage(content=f\"✅ Schéma chargé\")]\n",
+    "    }\n",
+    "\n",
+    "def chief_agent_node(state: AgentState) -> dict:\n",
+    "    \"\"\"Le chief analyse la requête et appelle l'outil approprié.\"\"\"\n",
+    "    prompt = f\"\"\"Tu es un assistant SQL/données. Tu as accès à :\n",
+    "1. execute_sql_query : pour interroger netflix.db\n",
+    "2. web_search : pour recherches web générales\n",
+    "3. omdb_api : pour infos précises sur films/séries\n",
+    "\n",
+    "Schéma disponible :\n",
+    "{state['schema']}\n",
+    "\n",
+    "Analyse la requête utilisateur et choisis L'OUTIL le plus adapté.\"\"\"\n",
+    "    \n",
+    "    messages = [{\"role\": \"system\", \"content\": prompt}] + [\n",
+    "        {\"role\": m.type, \"content\": m.content} for m in state[\"messages\"]\n",
+    "    ]\n",
+    "    \n",
+    "    response = llm_with_tools.invoke(messages)\n",
+    "    \n",
+    "    if response.tool_calls:\n",
+    "        tool_name = response.tool_calls[0][\"name\"]\n",
+    "        next_tool = {\n",
+    "            \"execute_sql_query\": \"sql\",\n",
+    "            \"web_search\": \"web\",\n",
+    "            \"omdb_api\": \"omdb\"\n",
+    "        }.get(tool_name, \"none\")\n",
+    "        \n",
+    "        return {\n",
+    "            \"next_tool\": next_tool,\n",
+    "            \"messages\": [response]\n",
+    "        }\n",
+    "    else:\n",
+    "        return {\n",
+    "            \"next_tool\": \"none\",\n",
+    "            \"messages\": [response]\n",
+    "        }\n",
+    "\n",
+    "def tool_executor_node(state: AgentState) -> dict:\n",
+    "    \"\"\"Exécute l'outil choisi par le chief.\"\"\"\n",
+    "    last_message = state[\"messages\"][-1]\n",
+    "    \n",
+    "    if not hasattr(last_message, \"tool_calls\") or not last_message.tool_calls:\n",
+    "        return {\"messages\": [AIMessage(content=\"⚠️ Aucun outil à exécuter\")]}\n",
+    "    \n",
+    "    tool_call = last_message.tool_calls[0]\n",
+    "    tool_name = tool_call[\"name\"]\n",
+    "    tool_args = tool_call[\"args\"]\n",
+    "    \n",
+    "    # Ajouter le chemin de la DB si nécessaire\n",
+    "    if tool_name == \"execute_sql_query\" and \"db_file_path\" not in tool_args:\n",
+    "        tool_args[\"db_file_path\"] = db_path\n",
+    "    \n",
+    "    tool_map = {\n",
+    "        \"execute_sql_query\": execute_sql_query,\n",
+    "        \"web_search\": web_search,\n",
+    "        \"omdb_api\": omdb_api\n",
+    "    }\n",
+    "    \n",
+    "    tool_func = tool_map.get(tool_name)\n",
+    "    if not tool_func:\n",
+    "        return {\"messages\": [AIMessage(content=f\"⚠️ Outil {tool_name} inconnu\")]}\n",
+    "    \n",
+    "    try:\n",
+    "        result = tool_func.invoke(tool_args)\n",
+    "        return {\"messages\": [AIMessage(content=f\"📊 Résultat {tool_name}:\\n{result}\")]}\n",
+    "    except Exception as e:\n",
+    "        return {\"messages\": [AIMessage(content=f\"❌ Erreur {tool_name}: {str(e)}\")]}\n",
+    "\n",
+    "def synthesize_node(state: AgentState) -> dict:\n",
+    "    \"\"\"Synthétise les résultats en réponse finale.\"\"\"\n",
+    "    prompt = \"\"\"Tu es un assistant qui synthétise les résultats.\n",
+    "Fournis une réponse claire, concise et en français à l'utilisateur.\n",
+    "Utilise les données disponibles dans l'historique des messages.\"\"\"\n",
+    "    \n",
+    "    messages = [{\"role\": \"system\", \"content\": prompt}] + [\n",
+    "        {\"role\": m.type, \"content\": m.content} for m in state[\"messages\"]\n",
+    "    ]\n",
+    "    \n",
+    "    response = llm.invoke(messages)\n",
+    "    return {\"messages\": [response]}\n",
+    "\n",
+    "# === ROUTING ===\n",
+    "def route_after_chief(state: AgentState) -> Literal[\"tool_executor\", \"synthesize\"]:\n",
+    "    return \"tool_executor\" if state[\"next_tool\"] != \"none\" else \"synthesize\"\n",
+    "\n",
+    "# === CONSTRUCTION DU GRAPHE ===\n",
+    "@st.cache_resource\n",
+    "def build_agent():\n",
+    "    \"\"\"Construit et compile le graphe LangGraph (mis en cache).\"\"\"\n",
+    "    workflow = StateGraph(AgentState)\n",
+    "    \n",
+    "    workflow.add_node(\"get_schema\", get_schema_node)\n",
+    "    workflow.add_node(\"chief_agent\", chief_agent_node)\n",
+    "    workflow.add_node(\"tool_executor\", tool_executor_node)\n",
+    "    workflow.add_node(\"synthesize\", synthesize_node)\n",
+    "    \n",
+    "    workflow.add_edge(START, \"get_schema\")\n",
+    "    workflow.add_edge(\"get_schema\", \"chief_agent\")\n",
+    "    workflow.add_conditional_edges(\n",
+    "        \"chief_agent\",\n",
+    "        route_after_chief,\n",
+    "        {\"tool_executor\": \"tool_executor\", \"synthesize\": \"synthesize\"}\n",
+    "    )\n",
+    "    workflow.add_edge(\"tool_executor\", \"synthesize\")\n",
+    "    workflow.add_edge(\"synthesize\", END)\n",
+    "    \n",
+    "    return workflow.compile()\n",
+    "\n",
+    "app = build_agent()\n",
+    "\n",
+    "# === INITIALISATION SESSION STATE ===\n",
+    "if \"chat_history\" not in st.session_state:\n",
+    "    st.session_state.chat_history = []\n",
+    "\n",
+    "if \"agent_state\" not in st.session_state:\n",
+    "    st.session_state.agent_state = None\n",
+    "\n",
+    "# === INTERFACE PRINCIPALE ===\n",
+    "st.title(\"🎬 Agent SQL Netflix\")\n",
+    "st.markdown(\"Posez des questions sur la base de données Netflix, recherchez des infos sur le web ou interrogez l'API OMDb !\")\n",
+    "\n",
+    "# === AFFICHAGE DE L'HISTORIQUE ===\n",
+    "chat_container = st.container()\n",
+    "\n",
+    "with chat_container:\n",
+    "    for msg in st.session_state.chat_history:\n",
+    "        if msg[\"role\"] == \"user\":\n",
+    "            with st.chat_message(\"user\", avatar=\"👤\"):\n",
+    "                st.markdown(msg[\"content\"])\n",
+    "        elif msg[\"role\"] == \"assistant\":\n",
+    "            with st.chat_message(\"assistant\", avatar=\"🤖\"):\n",
+    "                st.markdown(msg[\"content\"])\n",
+    "        elif msg[\"role\"] == \"tool\":\n",
+    "            with st.expander(f\"🔧 {msg['tool_name']}\", expanded=False):\n",
+    "                st.code(msg[\"content\"], language=\"json\")\n",
+    "\n",
+    "# === INPUT UTILISATEUR ===\n",
+    "user_input = st.chat_input(\"💬 Posez votre question...\", key=\"user_input\")\n",
+    "\n",
+    "if user_input:\n",
+    "    # Ajouter le message utilisateur\n",
+    "    st.session_state.chat_history.append({\n",
+    "        \"role\": \"user\",\n",
+    "        \"content\": user_input\n",
+    "    })\n",
+    "    \n",
+    "    # Afficher le message immédiatement\n",
+    "    with st.chat_message(\"user\", avatar=\"👤\"):\n",
+    "        st.markdown(user_input)\n",
+    "    \n",
+    "    # Préparer l'état de l'agent\n",
+    "    if st.session_state.agent_state is None:\n",
+    "        # Premier message\n",
+    "        agent_messages = [HumanMessage(content=user_input)]\n",
+    "    else:\n",
+    "        # Messages précédents + nouveau message\n",
+    "        agent_messages = st.session_state.agent_state[\"messages\"] + [HumanMessage(content=user_input)]\n",
+    "    \n",
+    "    inputs = {\n",
+    "        \"messages\": agent_messages,\n",
+    "        \"schema\": st.session_state.agent_state[\"schema\"] if st.session_state.agent_state else \"\",\n",
+    "        \"next_tool\": \"\"\n",
+    "    }\n",
+    "    \n",
+    "    # Placeholder pour la réponse en streaming\n",
+    "    with st.chat_message(\"assistant\", avatar=\"🤖\"):\n",
+    "        response_placeholder = st.empty()\n",
+    "        tool_placeholder = st.container()\n",
+    "        \n",
+    "        response_text = \"\"\n",
+    "        \n",
+    "        # Exécuter l'agent\n",
+    "        with st.spinner(\"🤔 Réflexion en cours...\"):\n",
+    "            for step in app.stream(inputs, stream_mode=\"values\"):\n",
+    "                last_msg = step[\"messages\"][-1]\n",
+    "                \n",
+    "                # Afficher les étapes intermédiaires\n",
+    "                if last_msg.type == \"ai\":\n",
+    "                    # Vérifier si c'est un appel d'outil\n",
+    "                    if hasattr(last_msg, \"tool_calls\") and last_msg.tool_calls:\n",
+    "                        tool_call = last_msg.tool_calls[0]\n",
+    "                        with tool_placeholder.expander(f\"🔧 Appel : {tool_call['name']}\", expanded=False):\n",
+    "                            st.json(tool_call[\"args\"])\n",
+    "                    else:\n",
+    "                        # Réponse finale\n",
+    "                        response_text = last_msg.content\n",
+    "                        response_placeholder.markdown(response_text)\n",
+    "        \n",
+    "        # Sauvegarder la réponse finale\n",
+    "        if response_text:\n",
+    "            st.session_state.chat_history.append({\n",
+    "                \"role\": \"assistant\",\n",
+    "                \"content\": response_text\n",
+    "            })\n",
+    "        \n",
+    "        # Sauvegarder l'état de l'agent\n",
+    "        st.session_state.agent_state = step\n",
+    "\n",
+    "# === EXEMPLES DE QUESTIONS ===\n",
+    "with st.expander(\"💡 Exemples de questions\", expanded=False):\n",
+    "    st.markdown(\"\"\"\n",
+    "    **SQL Database :**\n",
+    "    - Combien de films de 2020 dans la base ?\n",
+    "    - Quels sont les 5 films les mieux notés ?\n",
+    "    - Liste les réalisateurs qui ont fait plus de 3 films\n",
+    "    \n",
+    "    **Web Search :**\n",
+    "    - Quelles sont les sorties Netflix de cette semaine ?\n",
+    "    - Qui a gagné l'Oscar du meilleur film cette année ?\n",
+    "    \n",
+    "    **OMDb API :**\n",
+    "    - Donne-moi les infos complètes sur \"Inception\"\n",
+    "    - Quel est le réalisateur de \"The Dark Knight\" ?\n",
+    "    - Recherche des films avec \"Matrix\" dans le titre\n",
+    "    \"\"\")\n",
+    "\n",
+    "# === FOOTER ===\n",
+    "st.divider()\n",
+    "st.markdown(\"\"\"\n",
+    "<div style='text-align: center; color: #666; font-size: 0.9em;'>\n",
+    "    Propulsé par LangGraph + Streamlit | 🤖 Agent SQL Netflix\n",
+    "</div>\n",
+    "\"\"\", unsafe_allow_html=True)"
+   ]
+  }
+ ],
+ "metadata": {
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}

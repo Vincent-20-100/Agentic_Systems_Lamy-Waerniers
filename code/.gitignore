@@ -1,3 +1,11 @@
 .venv
 .env
 __pycache__
+
+
+data_level0.bin
+header.bin
+index_metadata.pickle
+length.bin
+link_lists.bin
+data\chroma_db\chroma.sqlite3
