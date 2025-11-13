@@ -52,8 +52,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
 # Paths
-SCRIPT_DIR = pathlib.Path(__file__).parent.absolute()
-PROJECT_ROOT = SCRIPT_DIR.parent  # Go up from code/ to project root
+PROJECT_ROOT = pathlib.Path.cwd()
+if PROJECT_ROOT.name == "code":
+    PROJECT_ROOT = PROJECT_ROOT.parent
+SCRIPT_DIR = str(PROJECT_ROOT / "code")
 DB_FOLDER_PATH = str(PROJECT_ROOT / "data" / "databases")
 CHROMA_PATH = str(PROJECT_ROOT / "data" / "chroma_db")
 MEMORY_PATH = str(PROJECT_ROOT / "data" / "memory")
