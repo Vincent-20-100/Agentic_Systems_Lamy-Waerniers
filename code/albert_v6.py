@@ -1,7 +1,7 @@
 """
-Albert v5 - Refactored Architecture
+Albert v6 - Refactored Architecture
 Planner → Conditional Tools → Synthesizer
-Launch: streamlit run albert_v5_refactored.py
+Launch: streamlit run albert_v6.py
 """
 
 import streamlit as st
@@ -26,7 +26,7 @@ import pathlib
 load_dotenv()
 
 # Configuration
-st.set_page_config(page_title="Albert v5", page_icon="🧙‍♂️", layout="wide")
+st.set_page_config(page_title="Albert query", page_icon="🧙‍♂️", layout="wide")
 
 st.markdown("""
 <style>
@@ -508,46 +508,25 @@ def build_agent():
     """Build workflow"""
     workflow = StateGraph(AgentState)
     
-    # Add nodes
     workflow.add_node("planner", planner_node)
     workflow.add_node("sql", sql_node)
     workflow.add_node("omdb", omdb_node)
     workflow.add_node("web", web_node)
     workflow.add_node("synthesize", synthesizer_node)
     
-    # Flow: START → planner → conditional tools → synthesize → END
+    # START → planner
     workflow.add_edge(START, "planner")
     
+    # From planner: route to ALL needed tools OR direct to synthesize
     workflow.add_conditional_edges(
         "planner",
         route_from_planner,
-        {
-            "sql": "sql",
-            "omdb": "omdb",
-            "web": "web",
-            "synthesize": "synthesize"
-        }
+        ["sql", "omdb", "web", "synthesize"]
     )
     
-    workflow.add_conditional_edges(
-        "sql",
-        route_from_sql,
-        {
-            "omdb": "omdb",
-            "web": "web",
-            "synthesize": "synthesize"
-        }
-    )
-    
-    workflow.add_conditional_edges(
-        "omdb",
-        route_from_omdb,
-        {
-            "web": "web",
-            "synthesize": "synthesize"
-        }
-    )
-    
+    # All tools converge to synthesize
+    workflow.add_edge("sql", "synthesize")
+    workflow.add_edge("omdb", "synthesize")
     workflow.add_edge("web", "synthesize")
     workflow.add_edge("synthesize", END)
     
