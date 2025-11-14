@@ -1,0 +1,24 @@
+{
+  "created_at": "2025-11-12T12:26:29.359534",
+  "total_records": 19925,
+  "total_embeddings": 19925,
+  "embedding_model": "text-embedding-3-small",
+  "dimensions": 1536,
+  "platforms": {
+    "amazon_prime": 9668,
+    "netflix": 8807,
+    "disney_plus": 1450
+  },
+  "content_types": {
+    "Movie": 14997,
+    "TV Show": 4928
+  },
+  "year_range": {
+    "min": 1920,
+    "max": 2021
+  },
+  "coverage": {
+    "has_description": 19925,
+    "description_percentage": 100.0
+  }
+}
