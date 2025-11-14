@@ -1,9 +1,3 @@
-"""
-Albert v6 - Refactored Architecture
-Planner → Conditional Tools → Synthesizer
-Launch: streamlit run albert_v6.py
-"""
-
 import streamlit as st
 import os
 import json
@@ -61,7 +55,7 @@ class PlannerOutput(BaseModel):
     """Planner decision output"""
     resolved_query: str = Field(..., description="Query reformulated with context from history")
     planning_reasoning: str = Field(..., description="Why these tools are needed")
-    needs_sql: bool = Field(default=True, description="Whether SQL query is needed")
+    needs_sql: bool = Field(default=False, description="Whether SQL query is needed")
     needs_omdb: bool = Field(default=False, description="Whether OMDB enrichment is needed")
     needs_web: bool = Field(default=False, description="Whether web search is needed")
     sql_query: Optional[str] = Field(None, description="Prepared SQL query if needed")
@@ -103,6 +97,7 @@ class AgentState(TypedDict):
     
     # Metadata
     sources_used: list
+    sources_detailed: list  # Structured sources with type, name, url, etc.
     current_step: str
 
 # === HELPER FUNCTIONS ===
@@ -119,79 +114,162 @@ def clean_json(text: str) -> str:
     return text.strip()
 
 def build_db_catalog(folder_path: str) -> dict:
-    """Build database catalog"""
+    """Build database catalog with unique values for all columns"""
     catalog = {
         "folder_path": folder_path,
         "databases": {},
         "error": None
     }
-    
+
     try:
-        db_files = [f for f in os.listdir(folder_path) 
+        db_files = [f for f in os.listdir(folder_path)
                    if f.endswith(('.db', '.sqlite', '.sqlite3'))]
     except FileNotFoundError:
         catalog["error"] = f"Folder {folder_path} not found"
         return catalog
-    
+
     if not db_files:
         catalog["error"] = "No databases found"
         return catalog
-    
+
     for db_file in db_files:
         db_path = os.path.join(folder_path, db_file)
         db_name = os.path.splitext(db_file)[0]
-        
+
         try:
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            
+
             db_info = {
                 "file_name": db_file,
                 "full_path": db_path,
                 "tables": {}
             }
-            
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
             tables = cursor.fetchall()
-            
+
             for (table_name,) in tables:
                 cursor.execute(f"PRAGMA table_info({table_name})")
                 columns = cursor.fetchall()
-                
-                db_info["tables"][table_name] = {
+
+                table_info = {
                     "columns": [
                         {"name": col[1], "type": col[2], "primary_key": bool(col[5])}
                         for col in columns
                     ],
-                    "column_names": [col[1] for col in columns]
+                    "column_names": [col[1] for col in columns],
+                    "unique_values": {}
                 }
-            
+
+                # Get row count
+                try:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    table_info["row_count"] = cursor.fetchone()[0]
+                except:
+                    table_info["row_count"] = None
+
+                # Get unique values for ALL columns
+                for col_info in columns:
+                    col_name = col_info[1]
+
+                    try:
+                        # Get distinct count first
+                        cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM {table_name} WHERE {col_name} IS NOT NULL")
+                        distinct_count = cursor.fetchone()[0]
+
+                        # If reasonable number of unique values, get them
+                        if distinct_count <= 50:
+                            cursor.execute(f"SELECT DISTINCT {col_name} FROM {table_name} WHERE {col_name} IS NOT NULL ORDER BY {col_name} LIMIT 50")
+                            unique_vals = [row[0] for row in cursor.fetchall()]
+                            table_info["unique_values"][col_name] = {
+                                "count": distinct_count,
+                                "values": unique_vals
+                            }
+                        else:
+                            # For columns with many values, get sample + range
+                            cursor.execute(f"SELECT DISTINCT {col_name} FROM {table_name} WHERE {col_name} IS NOT NULL ORDER BY {col_name} LIMIT 20")
+                            sample_vals = [row[0] for row in cursor.fetchall()]
+                            table_info["unique_values"][col_name] = {
+                                "count": distinct_count,
+                                "sample": sample_vals
+                            }
+                    except:
+                        pass
+
+                # Special handling for genre columns (comma-separated)
+                if "listed_in" in table_info["column_names"]:
+                    try:
+                        cursor.execute(f"SELECT DISTINCT listed_in FROM {table_name} WHERE listed_in IS NOT NULL")
+                        all_genres = set()
+                        for (genre_string,) in cursor.fetchall():
+                            if genre_string:
+                                genres = [g.strip() for g in str(genre_string).split(',')]
+                                all_genres.update(genres)
+                        table_info["unique_values"]["all_genres"] = sorted(list(all_genres))
+                    except:
+                        pass
+
+                db_info["tables"][table_name] = table_info
+
             catalog["databases"][db_name] = db_info
             conn.close()
-            
+
         except Exception as e:
             catalog["databases"][db_name] = {"error": str(e)}
-    
+
     return catalog
 
 def format_catalog_for_llm(catalog: dict) -> str:
-    """Format catalog for LLM"""
+    """Format catalog for LLM with all unique values"""
     if catalog.get("error"):
         return f"ERROR: {catalog['error']}"
-    
-    output = "AVAILABLE DATABASES:\n\n"
-    
+
+    output = "DATABASE CATALOG:\n\n"
+
     for db_name, db_info in catalog["databases"].items():
         if "error" in db_info:
             output += f"❌ {db_name}: {db_info['error']}\n"
             continue
-        
-        output += f"Database: {db_name}\n"
+
+        output += f"═══ Database: {db_name} ═══\n\n"
+
         for table_name, table_info in db_info["tables"].items():
-            cols = ", ".join([f"{c['name']} ({c['type']})" for c in table_info["columns"]])
-            output += f"  • {table_name}: {cols}\n"
-        output += "\n"
-    
+            output += f"TABLE: {table_name}\n"
+            output += f"Total rows: {table_info.get('row_count', 'unknown')}\n\n"
+
+            output += "COLUMNS:\n"
+            for col in table_info["columns"]:
+                pk_marker = " [PRIMARY KEY]" if col["primary_key"] else ""
+                output += f"  • {col['name']} ({col['type']}){pk_marker}\n"
+
+                # Add unique values info
+                col_name = col['name']
+                unique_info = table_info.get("unique_values", {}).get(col_name)
+
+                if unique_info:
+                    if "values" in unique_info:
+                        # Full list of unique values
+                        output += f"    → {unique_info['count']} unique values: "
+                        vals_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in unique_info['values'][:20]])
+                        output += vals_str
+                        if len(unique_info['values']) > 20:
+                            output += ", ..."
+                        output += "\n"
+                    elif "sample" in unique_info:
+                        # Sample for columns with many values
+                        output += f"    → {unique_info['count']} unique values (sample): "
+                        vals_str = ", ".join([f"'{v}'" if isinstance(v, str) else str(v) for v in unique_info['sample'][:10]])
+                        output += vals_str + ", ...\n"
+
+            # Add genre breakdown if available
+            if "all_genres" in table_info.get("unique_values", {}):
+                output += f"\nALL INDIVIDUAL GENRES (from listed_in column):\n"
+                genres = table_info["unique_values"]["all_genres"]
+                output += f"  {', '.join(genres)}\n"
+
+            output += "\n"
+
     return output
 
 # === TOOLS ===
@@ -278,6 +356,7 @@ AVAILABLE TOOLS (priority order):
 
 INSTRUCTIONS:
 - Resolve references from history (e.g., "that movie" → actual movie name)
+- If question is about DATABASE SCHEMA/STRUCTURE/TABLES, set needs_sql=False (schema is already in catalog)
 - Always prefer SQL first if question is about movie/series data
 - Use OMDB if user asks for: poster, detailed plot, actors, awards
 - Use Web only for: "latest", "trending", "news", "today", "this week"
@@ -306,7 +385,7 @@ OUTPUT: Structured decision with resolved query and tool flags"""
         return {
             "resolved_query": question,
             "planning_reasoning": f"Planning error: {str(e)}",
-            "needs_sql": True,
+            "needs_sql": False,
             "needs_omdb": False,
             "needs_web": False,
             "sql_query": "",
@@ -320,18 +399,39 @@ def sql_node(state: AgentState) -> dict:
     catalog = state.get("db_catalog", {})
     resolved_query = state.get("resolved_query", "")
     catalog_info = format_catalog_for_llm(catalog)
-    
-    prompt = f"""Generate SQL query to answer: "{resolved_query}"
+
+    prompt = f"""Generate a precise SQL query to answer: "{resolved_query}"
 
 {catalog_info}
 
-RULES:
-- Use LIKE with % for text search: WHERE title LIKE '%keyword%'
-- Always use LIMIT (default: 10)
-- Use ORDER BY for rankings (DESC for highest first)
-- Check column names carefully against catalog
+CRITICAL INSTRUCTIONS:
+1. **Table Names**: Use the EXACT table name from the catalog (e.g., 'shows', NOT 'movies' or 'netflix')
+2. **Type Filtering**:
+   - For movies: WHERE type = 'Movie'
+   - For TV shows: WHERE type = 'TV Show'
+   - Check the 'type' column unique values in the catalog above
+3. **Genre Search**:
+   - Genres are in 'listed_in' column as comma-separated strings
+   - Use: WHERE listed_in LIKE '%Action%' or '%Action & Adventure%'
+   - Check the 'ALL INDIVIDUAL GENRES' list in the catalog to use exact genre names
+4. **Year Filtering**:
+   - Column: 'release_year' (INTEGER)
+   - For 2000s: WHERE release_year >= 2000 AND release_year <= 2009
+   - Check the unique values range in the catalog
+5. **Text Search**:
+   - Title: WHERE title LIKE '%keyword%'
+   - Description: WHERE description LIKE '%keyword%'
+6. **Always use LIMIT**: Default 10, maximum 50
+7. **ORDER BY**: Use DESC for highest first (ratings, year)
 
-OUTPUT: SQL decision with query"""
+EXAMPLE QUERIES:
+- "action movies from 2000s":
+  SELECT * FROM shows WHERE type = 'Movie' AND listed_in LIKE '%Action%' AND release_year BETWEEN 2000 AND 2009 LIMIT 10
+
+- "top rated comedies":
+  SELECT * FROM shows WHERE type = 'Movie' AND listed_in LIKE '%Comed%' ORDER BY rating DESC LIMIT 10
+
+OUTPUT: SQL decision with database name and query"""
 
     structured_llm = llm.with_structured_output(SQLOutput)
     
@@ -344,10 +444,27 @@ OUTPUT: SQL decision with query"""
                 "db_name": decision.db_name,
                 "state_catalog": catalog
             })
-            
+
+            # Extract table name from query
+            table_name = "unknown"
+            if "FROM" in decision.query.upper():
+                try:
+                    from_clause = decision.query.upper().split("FROM")[1].split()[0]
+                    table_name = from_clause.strip()
+                except:
+                    pass
+
+            # Create detailed source
+            detailed_source = {
+                "type": "database",
+                "name": decision.db_name.replace("_", " ").title(),
+                "details": f"Table: {table_name}"
+            }
+
             return {
                 "sql_result": result,
                 "sources_used": state.get("sources_used", []) + [f"DB: {decision.db_name}"],
+                "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
                 "current_step": "sql_executed"
             }
         else:
@@ -381,9 +498,28 @@ def omdb_node(state: AgentState) -> dict:
     if title:
         try:
             result = omdb_api.invoke({"by": "title", "t": title, "plot": "full"})
+
+            # Try to extract IMDb ID for clickable link
+            imdb_url = None
+            try:
+                result_data = json.loads(result)
+                if "imdbID" in result_data:
+                    imdb_id = result_data["imdbID"]
+                    imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
+            except:
+                pass
+
+            # Create detailed source
+            detailed_source = {
+                "type": "omdb",
+                "name": f"OMDB: {title}",
+                "url": imdb_url
+            }
+
             return {
                 "omdb_result": result,
                 "sources_used": state.get("sources_used", []) + [f"OMDB: {title}"],
+                "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
                 "current_step": "omdb_executed"
             }
         except Exception as e:
@@ -406,9 +542,22 @@ def web_node(state: AgentState) -> dict:
     
     try:
         result = web_search.invoke({"query": web_query, "num_results": 5})
+
+        # Create DuckDuckGo search URL
+        import urllib.parse
+        search_url = f"https://duckduckgo.com/?q={urllib.parse.quote(web_query)}"
+
+        # Create detailed source
+        detailed_source = {
+            "type": "web",
+            "name": "Web Search",
+            "url": search_url
+        }
+
         return {
             "web_result": result,
             "sources_used": state.get("sources_used", []) + ["Web Search"],
+            "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
             "current_step": "web_executed"
         }
     except Exception as e:
@@ -426,12 +575,19 @@ def synthesizer_node(state: AgentState) -> dict:
     omdb = state.get("omdb_result", "{}")
     web = state.get("web_result", "{}")
     sources = state.get("sources_used", [])
-    
+    catalog = state.get("db_catalog", {})
+
+    # Include catalog info for schema-related questions
+    catalog_info = format_catalog_for_llm(catalog)
+
     prompt = f"""Generate a natural, helpful response using all available data.
 
 ORIGINAL QUESTION: "{question}"
 RESOLVED QUERY: "{resolved}"
 PLANNING CONTEXT: {reasoning}
+
+DATABASE SCHEMA (use this to answer questions about database structure):
+{catalog_info}
 
 AVAILABLE DATA:
 --- SQL Results ---
@@ -447,11 +603,13 @@ SOURCES: {', '.join(sources)}
 
 INSTRUCTIONS:
 - Answer the question naturally and clearly
+- If the question is about database schema/structure/tables, use the DATABASE SCHEMA section above
 - Integrate information from all sources seamlessly
 - Cite sources when mentioning specific facts
 - If data is missing or conflicting, acknowledge it gracefully
 - Keep response concise but complete
-- Use natural language, not just data dumps"""
+- Use natural language, not just data dumps
+- Format database schema information in a clear, readable way when requested"""
 
     response = llm.invoke(prompt)
     
@@ -551,14 +709,14 @@ if "db_catalog" not in st.session_state:
     if catalog.get("error"):
         welcome = f"❌ Error: {catalog['error']}"
     else:
-        welcome = "👋 **Hey! I'm Albert v5**\n\n"
-        welcome += "I can help you explore your movie/series databases!\n\n"
-        welcome += "**Available databases:**\n"
+        welcome = "##### 👋 **Salut, moi c'est Albert Query**\n\n"
+        welcome += "###### Je suis là pour vous aider à explorer vos bases de données !\n\n"
+        welcome += "\n\n"
+        welcome += "**Bases de données disponibles:**\n"
         for db_name, db_info in catalog["databases"].items():
             if "error" not in db_info:
-                tables = ", ".join(db_info["tables"].keys())
-                welcome += f"• **{db_name}**: {tables}\n"
-        welcome += "\n**Tools**: SQL → OMDB → Web Search\n\n**Ask me anything!**"
+                welcome += f"• {db_name}\n"
+        welcome += "\n**Outils**: SQL / OMDB / Recherche Web\n\n**Posez-moi une question !**"
     
     st.session_state.chat_messages.append({"role": "assistant", "content": welcome})
 
@@ -569,6 +727,27 @@ if "thread_id" not in st.session_state:
 for msg in st.session_state.chat_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        # Display sources if available
+        if "sources" in msg and msg["sources"]:
+            st.markdown("---")
+            st.caption("📚 Sources utilisées:")
+            cols = st.columns(len(msg["sources"]))
+            for idx, source in enumerate(msg["sources"]):
+                with cols[idx]:
+                    if source.get("type") == "database":
+                        st.markdown(f"🗄️ **{source['name']}**")
+                        if "details" in source:
+                            st.caption(source["details"])
+                    elif source.get("type") == "omdb":
+                        if source.get("url"):
+                            st.markdown(f"🎬 [{source['name']}]({source['url']})")
+                        else:
+                            st.markdown(f"🎬 **{source['name']}**")
+                    elif source.get("type") == "web":
+                        if source.get("url"):
+                            st.markdown(f"🌐 [Web Search]({source['url']})")
+                        else:
+                            st.markdown(f"🌐 **Web Search**")
 
 # User input
 if prompt := st.chat_input("Your question..."):
@@ -598,6 +777,7 @@ if prompt := st.chat_input("Your question..."):
             "omdb_result": "{}",
             "web_result": "{}",
             "sources_used": [],
+            "sources_detailed": [],
             "current_step": ""
         }
         
@@ -609,26 +789,56 @@ if prompt := st.chat_input("Your question..."):
             current = step.get("current_step", "")
             
             if current == "planned":
-                status.info("🧠 Planning...")
+                status.info("🧠 Albert réfléchit...")
             elif current == "sql_executed":
-                status.info("💾 Querying database...")
+                status.info("💾 Albert interroge la base de données SQL...")
             elif current == "omdb_executed":
-                status.info("🎬 Getting OMDB data...")
+                status.info("🎬 Albert interroge l'API OMDB...")
             elif current == "web_executed":
-                status.info("🌐 Searching web...")
+                status.info("🌐 Albert recherche sur le web...")
             elif current == "complete":
-                status.success("✅ Done!")
+                status.success("✅ Terminé !")
         
         if result:
             status.empty()
-            
+
             final_msgs = [m for m in result.get("messages", []) if isinstance(m, AIMessage)]
             if final_msgs:
                 response = final_msgs[-1].content
                 response_placeholder.markdown(response)
-                
-                st.session_state.chat_messages.append({"role": "assistant", "content": response})
-                
+
+                # Get detailed sources
+                sources_detailed = result.get("sources_detailed", [])
+
+                # Display sources below response
+                if sources_detailed:
+                    st.markdown("---")
+                    st.caption("📚 Sources utilisées:")
+                    cols = st.columns(len(sources_detailed))
+                    for idx, source in enumerate(sources_detailed):
+                        with cols[idx]:
+                            if source.get("type") == "database":
+                                st.markdown(f"🗄️ **{source['name']}**")
+                                if "details" in source:
+                                    st.caption(source["details"])
+                            elif source.get("type") == "omdb":
+                                if source.get("url"):
+                                    st.markdown(f"🎬 [{source['name']}]({source['url']})")
+                                else:
+                                    st.markdown(f"🎬 **{source['name']}**")
+                            elif source.get("type") == "web":
+                                if source.get("url"):
+                                    st.markdown(f"🌐 [Recherche Web]({source['url']})")
+                                else:
+                                    st.markdown(f"🌐 **Recherche Web**")
+
+                # Save message with sources
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "sources": sources_detailed
+                })
+
                 # Keep last user + assistant in agent messages
                 user_msgs = [m for m in result["messages"] if isinstance(m, HumanMessage)]
                 if user_msgs:
