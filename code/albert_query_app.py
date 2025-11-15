@@ -1,17 +1,20 @@
 import streamlit as st
 import os
 import json
+import urllib.parse
+import pathlib
 from typing import TypedDict, Annotated, Sequence, Optional
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.constants import Send
 from langgraph.checkpoint.memory import MemorySaver
 from dotenv import load_dotenv
+import operator
 import pathlib
 from utils import clean_json, build_db_catalog, format_catalog_for_llm, execute_sql_query, web_search, omdb_api
-
 
 # Load environment
 load_dotenv()
@@ -46,6 +49,10 @@ if not OPENAI_API_KEY:
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
 
+@st.cache_resource
+def get_db_catalog():
+    return build_db_catalog(DB_FOLDER_PATH)
+
 # === STRUCTURED OUTPUTS ===
 
 class PlannerOutput(BaseModel):
@@ -55,9 +62,9 @@ class PlannerOutput(BaseModel):
     needs_sql: bool = Field(default=False, description="Whether SQL query is needed")
     needs_omdb: bool = Field(default=False, description="Whether OMDB enrichment is needed")
     needs_web: bool = Field(default=False, description="Whether web search is needed")
-    sql_query: Optional[str] = Field(None, description="Prepared SQL query if needed")
-    omdb_query: Optional[str] = Field(None, description="Title to search in OMDB if needed")
-    web_query: Optional[str] = Field(None, description="Web search query if needed")
+    instructions_for_sql: str = Field(default="", description="Instructions pour le node SQL")
+    omdb_title: str = Field(default="", description="Exact movie title for the OMDB API call search by title")
+    instructions_for_web: str = Field(default="", description="Instructions pour le node Web")
 
 class SQLOutput(BaseModel):
     """SQL execution decision"""
@@ -66,11 +73,28 @@ class SQLOutput(BaseModel):
     query: Optional[str] = Field(None, description="SQL query to execute")
     reasoning: str = Field(..., description="Why this query or why SQL cannot answer")
 
+class OMDBOutput(BaseModel):
+    """OMDB query decision"""
+    title: Optional[str] = Field(None, description="Exact movie title or None")
+    plot: str = Field("full", description="short or full")
+    reasoning: str = Field(..., description="Why these choices")
+
+class WebOutput(BaseModel):
+    """Web search query construction"""
+    search_query: str = Field(..., description="Optimized search query for DuckDuckGo (3-8 words)")
+    reasoning: str = Field(..., description="Why this search query was chosen")
+
+class SynthesizerOutput(BaseModel):
+    """Synthesizer response and completeness evaluation"""
+    response: str = Field(..., description="Natural language response, integrating all available data")
+    needs_more_data: bool = Field(False, description="Whether additional data collection is needed")
+    missing_info: Optional[str] = Field(None, description="What specific information is missing (if needs_more_data=True)")
+    reasoning: str = Field(..., description="Evaluation of data completeness and response quality")
+
 # === AGENT STATE ===
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    db_catalog: dict
     # Planning
     original_question: str
     resolved_query: str
@@ -88,132 +112,114 @@ class AgentState(TypedDict):
     omdb_result: str
     web_result: str
     # Metadata
-    sources_used: list
-    sources_detailed: list
+    sources_detailed: Annotated[list, operator.add]
     current_step: str
 
 # === WORKFLOW NODES ===
 
 def planner_node(state: AgentState) -> dict:
-      """Analyze query and plan tool usage"""
-      question = state.get("original_question", "")
-      history = state.get("messages", [])
-      catalog = state.get("db_catalog", {})
+    """Decide which tools to use and provide instructions"""
+    question = state.get("original_question", "")
+    history = state.get("messages", [])
+    previous_synthesis = state.get("synthesis", "")
 
-      # Format tool responses clearly
-      sql_res = state.get("sql_result", "")
-      omdb_res = state.get("omdb_result", "")
-      web_res = state.get("web_result", "")
-      catalog_info = format_catalog_for_llm(catalog)
+    sql_res = state.get("sql_result", "")
+    omdb_res = state.get("omdb_result", "")
+    web_res = state.get("web_result", "")
+    catalog = get_db_catalog()
+    catalog_info = format_catalog_for_llm(catalog)
 
-      prompt = f"""You are a planning agent you have to interpet user questions and decide which tools to use to answer them.
-  Your goal is to help the user explore movie/series data across multiple SQL databases, an external movie API (OMDB), and web search.
-  You must decide which tools are needed, prepare queries for them, and resolve any ambiguous references from the conversation history.
+    prompt = f"""You are a planning agent. Decide which tools to use and provide instructions.
 
-  ORIGINAL QUESTION: "{question}"
+  PREVIOUS SYNTHESIS (none is first iteration): "{previous_synthesis}"
 
-  CONVERSATION HISTORY (last 5 messages):
-  {json.dumps([{"role": m.type, "content": m.content} for m in history[-5:]], indent=2)}
+  QUESTION: "{question}"
+
+  HISTORY (last 3): {json.dumps([{"role": m.type, "content": m.content[:100]} for m in history[-3:]], indent=2)}
+
+  DATABASE CATALOG:{catalog_info}
+
+  PREVIOUS DATA COLLECTED:
+  - SQL: {('✅ ' + sql_res[:100] + '...') if sql_res else '❌ Not retrieved'}
+  - OMDB: {('✅ ' + omdb_res[:100] + '...') if omdb_res else '❌ Not retrieved'}
+  - Web: {('✅ ' + web_res[:100] + '...') if web_res else '❌ Not retrieved'}
+
+  AVAILABLE TOOLS:
+  1. SQL Database - Query movies/series (titles, ratings, cast, genres)
+     Available DBs: {', '.join(get_db_catalog()['databases'].keys())}
+  2. OMDB API - Get posters, detailed plots, awards (needs exact title)
+  3. Web Search - Recent news, reviews, trending info
+
+  DECISION LOGIC:
+  - Structured movie data → needs_sql=True
+  - Have title, need poster/details → needs_omdb=True
+  - Current events/reviews → needs_web=True
+
+  EXAMPLES:
+  Q: "Gladiator poster" → needs_sql=True ("Find 'Gladiator' exact title"), needs_omdb=True ("Get poster for Gladiator")
+  Q: "10 films in 2020" → needs_sql=True only ("Find 10 random movies")
+  Q: "Latest Marvel news" → needs_web=True only ("Search Marvel news 2024")
+
+  FOR OMDB OUTPUT: Just extract title for the API call search by title.
+  
+  Provide clear, actionable instructions for each enabled tool."""
+
+    structured_llm = llm.with_structured_output(PlannerOutput)
+
+    try:
+        plan = structured_llm.invoke(prompt)
+
+        return {
+            "resolved_query": plan.resolved_query,
+            "planning_reasoning": plan.planning_reasoning,
+            "needs_sql": plan.needs_sql,
+            "needs_omdb": plan.needs_omdb,
+            "needs_web": plan.needs_web,
+            "instructions_for_sql": plan.instructions_for_sql,
+            "omdb_query": plan.omdb_title,
+            "instructions_for_web": plan.instructions_for_web,
+            "current_step": "planned"
+        }
+    except Exception as e:
+        return {
+            "resolved_query": question,
+            "planning_reasoning": f"Planning error: {str(e)}",
+            "needs_sql": False,
+            "needs_omdb": False,
+            "needs_web": False,
+            "instructions_for_sql": "",
+            "omdb_query": "",
+            "instructions_for_web": "",
+            "current_step": "planned"
+        }
+
+def sql_node(state: AgentState) -> dict:
+    """Execute SQL query - constructs query based on planner instructions"""
+    instructions = state.get("instructions_for_sql", "")
+    resolved_query = state.get("resolved_query", "")
+    catalog = get_db_catalog()
+    catalog_info = format_catalog_for_llm(catalog)
+
+    prompt = f"""Generate SQL query from planner instructions.
+
+  INSTRUCTIONS: "{instructions}"
+  CONTEXT: "{resolved_query}"
 
   {catalog_info}
 
-  AVAILABLE DATA:
-  --- SQL Results ---
-  {sql_res}
+  SQL RULES:
+  1. Use EXACT table/column names from catalog above
+  2. Text search: LIKE '%keyword%' (case-insensitive)
+  3. Comma-separated fields (genres, cast): LIKE '%value%'
+  4. Top/best queries: ORDER BY rating/score DESC
+  5. Always add LIMIT (default 10, max 50)
+  6. Check unique values in catalog to validate filters
 
-  --- OMDB Data ---
-  {omdb_res}
+  EXAMPLES:
+  - "Find Inception" → SELECT * FROM movies WHERE title LIKE '%Inception%' LIMIT 1
+  - "5 action films" → SELECT * FROM movies WHERE listed_in LIKE '%Action%' LIMIT 5
 
-  --- Web Results ---
-  {web_res}
-
-  AVAILABLE TOOLS:
-  1. SQL Database - Query movies/series data (titles, ratings, years, genres, cast)
-  2. OMDB API - Get posters, detailed plot, actors, awards (requires movie TITLE from SQL!)
-  3. Web Search - Recent news, trending topics only
-
-  DECISION LOGIC:
-  - If question needs movie data → SQL first to get titles
-  - If SQL returned titles AND user wants poster/details → Use OMDB with exact title from SQL
-  - If question is about schema/structure → NO tools needed (catalog has everything)
-  - If you have enough data to answer OR iteration >= 3 → set all needs_* to False
-
-  INSTRUCTIONS:
-  - Resolve references from history (e.g., "that movie" → actual movie name)
-  - If OMDB is needed, extract the EXACT movie title from SQL results and put it in omdb_query
-  - For poster requests: SQL first (iteration 1), then OMDB (iteration 2)
-  - Only set one tool to True per iteration (sequential execution)
-  - If you already have sufficient data to answer → set all to False
-
-  OUTPUT: Structured decision with resolved query and tool flags"""
-
-      structured_llm = llm.with_structured_output(PlannerOutput)
-
-      try:
-          plan = structured_llm.invoke(prompt)
-
-          return {
-              "resolved_query": plan.resolved_query,
-              "planning_reasoning": plan.planning_reasoning,
-              "needs_sql": plan.needs_sql,
-              "needs_omdb": plan.needs_omdb,
-              "needs_web": plan.needs_web,
-              "sql_query": plan.sql_query or "",
-              "omdb_query": plan.omdb_query or "",
-              "web_query": plan.web_query or "",
-              "current_step": "planned",
-          }
-      except Exception as e:
-          return {
-              "resolved_query": question,
-              "planning_reasoning": f"Planning error: {str(e)}",
-              "needs_sql": False,
-              "needs_omdb": False,
-              "needs_web": False,
-              "sql_query": "",
-              "omdb_query": "",
-              "web_query": "",
-              "current_step": "planned"
-          }
-
-def sql_node(state: AgentState) -> dict:
-    """Execute SQL query"""
-    catalog = state.get("db_catalog", {})
-    resolved_query = state.get("resolved_query", "")
-    catalog_info = format_catalog_for_llm(catalog)
-
-    prompt = f"""Generate a precise SQL query to answer: "{resolved_query}"
-
-{catalog_info}
-
-CRITICAL INSTRUCTIONS:
-1. **Table Names**: Use the EXACT table name from the catalog (e.g., 'shows', NOT 'movies' or 'netflix')
-2. **Type Filtering**:
-   - For movies: WHERE type = 'Movie'
-   - For TV shows: WHERE type = 'TV Show'
-   - Check the 'type' column unique values in the catalog above
-3. **Genre Search**:
-   - Genres are in 'listed_in' column as comma-separated strings
-   - Use: WHERE listed_in LIKE '%Action%' or '%Action & Adventure%'
-   - Check the 'ALL INDIVIDUAL GENRES' list in the catalog to use exact genre names
-4. **Year Filtering**:
-   - Column: 'release_year' (INTEGER)
-   - For 2000s: WHERE release_year >= 2000 AND release_year <= 2009
-   - Check the unique values range in the catalog
-5. **Text Search**:
-   - Title: WHERE title LIKE '%keyword%'
-   - Description: WHERE description LIKE '%keyword%'
-6. **Always use LIMIT**: Default 10, maximum 50
-7. **ORDER BY**: Use DESC for highest first (ratings, year)
-
-EXAMPLE QUERIES:
-- "action movies from 2000s":
-  SELECT * FROM shows WHERE type = 'Movie' AND listed_in LIKE '%Action%' AND release_year BETWEEN 2000 AND 2009 LIMIT 10
-
-- "top rated comedies":
-  SELECT * FROM shows WHERE type = 'Movie' AND listed_in LIKE '%Comed%' ORDER BY rating DESC LIMIT 10
-
-OUTPUT: SQL decision with database name and query"""
+  Provide database name and query."""
 
     structured_llm = llm.with_structured_output(SQLOutput)
     
@@ -224,7 +230,7 @@ OUTPUT: SQL decision with database name and query"""
             result = execute_sql_query.invoke({
                 "query": decision.query,
                 "db_name": decision.db_name,
-                "state_catalog": catalog
+                "state_catalog": catalog 
             })
 
             # Extract table name from query
@@ -236,7 +242,6 @@ OUTPUT: SQL decision with database name and query"""
                 except:
                     pass
 
-            # Create detailed source
             detailed_source = {
                 "type": "database",
                 "name": decision.db_name.replace("_", " ").title(),
@@ -245,9 +250,7 @@ OUTPUT: SQL decision with database name and query"""
 
             return {
                 "sql_result": result,
-                "sources_used": state.get("sources_used", []) + [f"DB: {decision.db_name}"],
-                "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
-                "current_step": "sql_executed"
+                "sources_detailed": [detailed_source]
             }
         else:
             return {
@@ -255,81 +258,96 @@ OUTPUT: SQL decision with database name and query"""
                 "current_step": "sql_skipped"
             }
     except Exception as e:
-        return {
-            "sql_result": json.dumps({"error": str(e)}),
-            "current_step": "sql_error"
-        }
+        return {"sql_result": json.dumps({"error": str(e)})}
 
 def omdb_node(state: AgentState) -> dict:
-    """Execute OMDB query"""
-    omdb_query = state.get("omdb_query", "")
-    sql_result = state.get("sql_result", "[]")
-    
-    # Try to get title from OMDB query or SQL result
-    title = omdb_query
-    
-    if not title:
-        try:
-            data = json.loads(sql_result)
-            if isinstance(data, list) and len(data) > 0:
-                item = data[0]
-                title = item.get("title") or item.get("Title") or item.get("name")
-        except:
-            pass
-    
-    if title:
-        try:
-            result = omdb_api.invoke({"by": "title", "t": title, "plot": "full"})
+      """Execute OMDB query - simple and robust"""
+      omdb_query = state.get("omdb_query", "")
+      sql_result = state.get("sql_result", "[]")
 
-            # Try to extract IMDb ID for clickable link
-            imdb_url = None
-            try:
-                result_data = json.loads(result)
-                if "imdbID" in result_data:
-                    imdb_id = result_data["imdbID"]
-                    imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
-            except:
-                pass
+      # Try to get title from omdb_query (from planner) or SQL result (fallback)
+      title = omdb_query
 
-            # Create detailed source
-            detailed_source = {
-                "type": "omdb",
-                "name": f"OMDB: {title}",
-                "url": imdb_url
-            }
+      # Fallback: extract from SQL if omdb_query is empty
+      # Note: In parallel execution, sql_result might be empty, that's OK
+      if not title and sql_result != "[]":
+          try:
+              data = json.loads(sql_result)
+              if isinstance(data, list) and len(data) > 0:
+                  item = data[0]
+                  title = item.get("title") or item.get("Title") or item.get("name")
+          except:
+              pass
 
-            return {
-                "omdb_result": result,
-                "sources_used": state.get("sources_used", []) + [f"OMDB: {title}"],
-                "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
-                "current_step": "omdb_executed"
-            }
-        except Exception as e:
-            return {
-                "omdb_result": json.dumps({"error": str(e)}),
-                "current_step": "omdb_error"
-            }
+      if title:
+          try:
+              result = omdb_api.invoke({"by": "title", "t": title, "plot": "full"})
+
+              # Extract IMDb ID for clickable link
+              imdb_url = None
+              try:
+                  result_data = json.loads(result)
+                  if "imdbID" in result_data:
+                      imdb_id = result_data["imdbID"]
+                      imdb_url = f"https://www.imdb.com/title/{imdb_id}/"
+              except:
+                  pass
+
+              # Create detailed source
+              detailed_source = {
+                  "type": "omdb",
+                  "name": f"OMDB: {title}",
+                  "url": imdb_url
+              }
+
+              return {
+                  "omdb_result": result,
+                  "sources_used": [f"OMDB: {title}"],
+                  "sources_detailed": [detailed_source],
+              }
+          except Exception as e:
+              return {
+                  "omdb_result": json.dumps({"error": str(e)}),
+              }
+
+      return {
+          "omdb_result": "{}",
+      }
     
-    return {
-        "omdb_result": "{}",
-        "current_step": "omdb_skipped"
-    }
-
 def web_node(state: AgentState) -> dict:
-    """Execute web search"""
-    web_query = state.get("web_query", "")
+    """Execute web search - constructs query based on instructions"""
+    instructions = state.get("instructions_for_web", "")
+    resolved_query = state.get("resolved_query", "")
     
-    if not web_query:
-        web_query = state.get("resolved_query", "")
-    
+    prompt = f"""Create optimized web search query for DuckDuckGo.
+
+  PLANNER INSTRUCTIONS: "{instructions}"
+  USER CONTEXT: "{resolved_query}"
+
+  SEARCH STRATEGIES:
+  - Movie news → "[title] latest news 2024"
+  - Reviews/critics → "[title] reviews ratings"
+  - General info → "[title] plot cast summary"
+  - Trending topics → "[keyword] trending discussion"
+
+  RULES:
+  - 3-8 words maximum
+  - No quotes, no special characters
+  - Year context if relevant (2024, 2025)
+
+  Output concise search query with reasoning."""
+
     try:
-        result = web_search.invoke({"query": web_query, "num_results": 5})
+        structured_llm = llm.with_structured_output(WebOutput)
+        decision = structured_llm.invoke(prompt)
 
-        # Create DuckDuckGo search URL
-        import urllib.parse
-        search_url = f"https://duckduckgo.com/?q={urllib.parse.quote(web_query)}"
+        result = web_search.invoke({
+            "query": decision.search_query,
+            "num_results": 5
+        })
 
-        # Create detailed source
+        search_url = f"https://duckduckgo.com/?q={urllib.parse.quote(decision.search_query)}"
+
         detailed_source = {
             "type": "web",
             "name": "Web Search",
@@ -338,65 +356,68 @@ def web_node(state: AgentState) -> dict:
 
         return {
             "web_result": result,
-            "sources_used": state.get("sources_used", []) + ["Web Search"],
-            "sources_detailed": state.get("sources_detailed", []) + [detailed_source],
-            "current_step": "web_executed"
+            "sources_detailed": [detailed_source]
         }
     except Exception as e:
-        return {
-            "web_result": json.dumps({"error": str(e)}),
-            "current_step": "web_error"
-        }
+        return {"web_result": json.dumps({"error": str(e)})}
 
 def synthesizer_node(state: AgentState) -> dict:
-      """Generate final response"""
-      question = state.get("original_question", "")
-      resolved = state.get("resolved_query", "")
-      reasoning = state.get("planning_reasoning", "")
-      sql = state.get("sql_result", "[]")
-      omdb = state.get("omdb_result", "{}")
-      web = state.get("web_result", "{}")
-      sources = state.get("sources_used", [])
-      catalog = state.get("db_catalog", {})
+    """Generate final response and decide if more data is needed"""
+    question = state.get("original_question", "")
+    reasoning = state.get("planning_reasoning", "")
+    sql = state.get("sql_result", "[]")
+    omdb = state.get("omdb_result", "{}")
+    web = state.get("web_result", "{}")
 
-      # Include catalog info for schema-related questions
-      catalog_info = format_catalog_for_llm(catalog)
+    prompt = f"""Generate natural response using all available data.
 
-      prompt = f"""Generate a natural, helpful response in the user language using all available data.
+  QUESTION: "{question}"
+  PLANNING: {reasoning}
 
-  ORIGINAL QUESTION: "{question}"
-  RESOLVED QUERY: "{resolved}"
-  PLANNING CONTEXT: {reasoning}
+  DATA SOURCES:
+  --- SQL Database ---
+  {sql if sql != '[]' else '❌ Aucune donnée'}
 
-  DATABASE SCHEMA (use this to answer questions about database structure):
-  {catalog_info}
+  --- OMDB API ---
+  {omdb if omdb != '{{}}' else '❌ Aucune donnée'}
 
-  AVAILABLE DATA:
-  --- SQL Results ---
-  {sql}
+  --- Web Search ---
+  {web if web != '{{}}' else '❌ Aucune donnée'}
 
-  --- OMDB Data ---
-  {omdb}
+  FORMATTING RULES:
+  1. **OMDB Posters**: If "Poster" field present → "Voici l'affiche : [URL]"
+  2. **Data integration**: Seamlessly combine sources, don't dump JSON
+  3. **Citations**: "Selon OMDB...", "Dans la base de données..."
+  4. **Conciseness**: Max 200 words unless detailed analysis requested
 
-  --- Web Results ---
-  {web}
+  COMPLETENESS EVALUATION:
+  - Missing critical data (poster requested but no OMDB)? → needs_more_data=True, missing_info="OMDB poster data"
+  - All essential info present? → needs_more_data=False
+  - Partial data but sufficient for answer? → needs_more_data=False
 
-  SOURCES: {', '.join(sources)}
+  Provide response, needs_more_data flag, and reasoning."""
 
-  GENERAL INSTRUCTIONS:
-  - Answer naturally and clearly in French
-  - Use DATABASE SCHEMA for structure questions (no SQL needed)
-  - Integrate all source data seamlessly
-  - Cite sources when mentioning facts
-  - Keep responses concise but complete
-  - Use natural language, not raw JSON dumps"""
-
-      response = llm.invoke(prompt)
+    try:
+      structured_llm = llm.with_structured_output(SynthesizerOutput)
+      output = structured_llm.invoke(prompt)
 
       return {
-          "messages": [AIMessage(content=response.content)],
-          "current_step": "complete"
+          "synthesis": output.response,
+          "needs_more_data": output.needs_more_data,
+          "messages": [AIMessage(content=output.response)],
+          "missing_info": output.missing_info,
+          "reasoning": output.reasoning,
+          "current_step": "synthesized"
       }
+    except Exception as e:
+        return {
+          "synthesis": f"Erreur lors de la génération de la réponse: {str(e)}",
+          "needs_more_data": False,
+          "messages": [AIMessage(content=f"Erreur: {str(e)}")],
+          "missing_info": "",
+          "reasoning": "",
+          "current_step": "synthesize_error"
+        }
 
 # === ROUTING ===
 
@@ -412,71 +433,59 @@ def should_run_web(state: AgentState) -> bool:
     """Check if web search should run"""
     return state.get("needs_web", False)
 
-def route_from_planner(state: AgentState) -> str:
-    """Route from planner to first tool or synthesizer"""
-    iteration = state.get("iteration_count", 0)
-    if iteration > 5:
-          return "synthesize"    # Prevent infinite loops (max 5 iterations)
-    if state.get("needs_sql"):
-        return "sql"
-    elif state.get("needs_omdb"):
-        return "omdb"
-    elif state.get("needs_web"):
-        return "web"
-    else:
-        return "synthesize"
+def route_from_planner(state: AgentState) -> list:
+      """Route from planner to tools in parallel using Send"""
+      iteration = state.get("iteration_count", 0)
+      if iteration > 5:
+          return [Send("synthesize", state)]
 
-def route_from_sql(state: AgentState) -> str:
-    """Route from SQL to next tool"""
-    if state.get("needs_omdb"):
-        return "omdb"
-    elif state.get("needs_web"):
-        return "web"
-    else:
-        return "synthesize"
+      # Collect all tools to run in parallel
+      sends = []
+      if state.get("needs_sql"):
+          sends.append(Send("sql", state))
+      if state.get("needs_omdb"):
+          sends.append(Send("omdb", state))
+      if state.get("needs_web"):
+          sends.append(Send("web", state))
 
-def route_from_omdb(state: AgentState) -> str:
-    """Route from OMDB to next tool"""
-    if state.get("needs_sql"):
-        return "sql"
-    if state.get("needs_web"):
-        return "web"
-    else:
-        return "synthesize"
+      # If no tools needed, go to synthesizer
+      if not sends:
+          sends.append(Send("synthesize", state))
+
+      return sends
+
+def route_from_synthesizer(state: AgentState) -> str:
+    """Decide if we need more data or can end"""
+    needs_more = state.get("needs_more_data", False)
     
-def route_from_web(state: AgentState) -> str:
-    """Route from Web to next tool"""
-    if state.get("needs_sql"):
-        return "sql"
-    if state.get("needs_omdb"):
-        return "omdb"
+    if needs_more:
+        return "planner"
     else:
-        return "synthesize"
+        return END
 
 # === BUILD GRAPH ===
 
 @st.cache_resource
 def build_agent():
-      """Build workflow with iteration loop"""
-      workflow = StateGraph(AgentState)
+    """Build workflow with parallel tool execution"""
+    workflow = StateGraph(AgentState)
 
-      workflow.add_node("planner", planner_node)
-      workflow.add_node("sql", sql_node)
-      workflow.add_node("omdb", omdb_node)
-      workflow.add_node("web", web_node)
-      workflow.add_node("synthesize", synthesizer_node)
+    workflow.add_node("planner", planner_node)
+    workflow.add_node("sql", sql_node)
+    workflow.add_node("omdb", omdb_node)
+    workflow.add_node("web", web_node)
+    workflow.add_node("synthesize", synthesizer_node)
 
-      workflow.add_edge(START, "planner")
+    workflow.add_edge(START, "planner")
 
-      workflow.add_conditional_edges("planner", route_from_planner, ["sql", "omdb", "web", "synthesize"])
-      workflow.add_conditional_edges("sql", route_from_sql, ["omdb", "web", "synthesize"])
-      workflow.add_conditional_edges("omdb", route_from_omdb, ["sql", "web", "synthesize"])
-      workflow.add_conditional_edges("web", route_from_web, ["sql", "omdb", "synthesize"])
+    workflow.add_conditional_edges("planner", route_from_planner, ["sql", "omdb", "web", "synthesize"])
+    workflow.add_edge("sql", "synthesize")
+    workflow.add_edge("omdb", "synthesize")
+    workflow.add_edge("web", "synthesize")
+    workflow.add_conditional_edges("synthesize", route_from_synthesizer, ["planner", END])
 
-      workflow.add_edge("synthesize", END)
-
-      checkpointer = MemorySaver()
-      return workflow.compile(checkpointer=checkpointer)
+    checkpointer = MemorySaver()
+    return workflow.compile(checkpointer=checkpointer)
 
 app = build_agent()
 
@@ -487,24 +496,26 @@ if "chat_messages" not in st.session_state:
 
 if "agent_messages" not in st.session_state:
     st.session_state.agent_messages = []
+    
+    catalog = get_db_catalog()
 
-if "db_catalog" not in st.session_state:
-    catalog = build_db_catalog(DB_FOLDER_PATH)
-    st.session_state.db_catalog = catalog
-    
     # Welcome message
-    if catalog.get("error"):
-        welcome = f"❌ Error: {catalog['error']}"
-    else:
-        welcome = "##### 👋 **Salut, moi c'est Albert Query**\n\n"
-        welcome += "##### Je suis là pour t'aider à explorer tes bases de données !\n\n"
-        welcome += "\n\n"
-        welcome += "**Bases de données disponibles:**\n"
-        for db_name, db_info in catalog["databases"].items():
-            if "error" not in db_info:
-                welcome += f" {db_name} -\n"
-        welcome += "**Outils disponibles**: Requête de base de données SQL / Requête d'API OMDB / Recherche Web\n\n**Demande-moi quelque chose pour commencer !**\n\nPar exemple :\n- Quelles tables et colonnes sont disponibles dans les bases de données ?\n- Combien de genres différents sont disponibles dans toutes les bases ?\n- Trouve-moi 5 films d'action des années 2000 dans Netflix.\n- Quels sont les films avec les meilleures notes sur Disney Plus ?\n- Donne-moi des comédies récentes sur Amazon Prime."
-    
+    welcome = "##### 👋 **Salut, moi c'est Albert Query**\n\n"
+    welcome += "##### Je suis là pour t'aider à explorer tes bases de données !\n\n"
+    welcome += "\n\n"
+    welcome += "**Bases de données disponibles:**\n"
+    for db_name, db_info in catalog["databases"].items():
+        if "error" not in db_info:
+            welcome += f" {db_name} -\n"
+    welcome += "**Outils disponibles**: Requête de base de données SQL / Requête d'API OMDB / Recherche Web\n\n"
+    welcome += "**Demande-moi quelque chose pour commencer !**\n\n"
+    welcome += "Par exemple :\n"
+    welcome += "- Quelles tables et colonnes sont disponibles dans les bases de données ?\n"
+    welcome += "- Combien de genres différents sont disponibles dans toutes les bases ?\n"
+    welcome += "- Trouve-moi 5 films d'action des années 2000 dans Netflix.\n"
+    welcome += "- Quels sont les films avec les meilleures notes sur Disney Plus ?\n"
+    welcome += "- Donne-moi des comédies récentes sur Amazon Prime.\n"
+        
     st.session_state.chat_messages.append({"role": "assistant", "content": welcome})
 
 if "thread_id" not in st.session_state:
@@ -550,7 +561,6 @@ if prompt := st.chat_input("Your question..."):
         
         inputs = {
             "messages": st.session_state.agent_messages,
-            "db_catalog": st.session_state.db_catalog,
             "original_question": prompt,
             "resolved_query": "",
             "planning_reasoning": "",
@@ -563,7 +573,6 @@ if prompt := st.chat_input("Your question..."):
             "sql_result": "[]",
             "omdb_result": "{}",
             "web_result": "{}",
-            "sources_used": [],
             "sources_detailed": [],
             "current_step": ""
         }
@@ -575,16 +584,10 @@ if prompt := st.chat_input("Your question..."):
             result = step
             current = step.get("current_step", "")
             
-            if current == "planned":
+            if current == "planned" or current == "synthesized":
                 status.info("🧠 Albert réfléchit...")
-            elif current == "sql_executed":
-                status.info("💾 Albert interroge la base de données SQL...")
-            elif current == "omdb_executed":
-                status.info("🎬 Albert interroge l'API OMDB...")
-            elif current == "web_executed":
-                status.info("🌐 Albert recherche sur le web...")
-            elif current == "complete":
-                status.success("✅ Terminé !")
+            elif current == "collected":
+                status.info("🔄 Albert collecte les données...")
         
         if result:
             status.empty()

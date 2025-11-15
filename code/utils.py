@@ -2,9 +2,18 @@ import os
 import json
 import sqlite3
 import requests
+import pathlib
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchResults
 
+# API Keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+OMDB_BASE_URL = "http://www.omdbapi.com/"
+
+# Paths
+PROJECT_ROOT = pathlib.Path("C:/Users/Vincent/GitHub/Vincent-20-100/Agentic_Systems_Project_Vlamy")
+DB_FOLDER_PATH = str(PROJECT_ROOT / "data" / "databases")
 
 # === HELPER FUNCTIONS ===
 
@@ -235,3 +244,4 @@ def omdb_api(by: str = "title", t: str = None, plot: str = "full") -> str:
         return response.text
     except Exception as e:
         return json.dumps({"error": str(e)})
+
