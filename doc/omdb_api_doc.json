@@ -1,0 +1,384 @@
+{
+    "description": "This documentation outlines the structure and specifications of the OMDB API (Open Movie Database). It is organized into two main dictionaries:\n- \"arguments\": Defines all input parameters accepted by the API, split into two query modes:\n    \u2022 by_id_or_title: Search by IMDb ID or exact title.\n    \u2022 by_search: Keyword-based search (fuzzy matching).\n  Each parameter includes: required status, data type, valid values, default value (if any), clear description, and example.\n  Note: In by_id_or_title mode, **at least one of 'i' or 't' is required**.\n- \"responses\": Describes the structure of the API's returned data, with data type and example for each field.\nThese dictionaries enable building valid OMDB API requests and automatically parsing responses.\n\n**Important**: An API key (`apikey`) is **required** for all requests.",
+    "base_url": "http://www.omdbapi.com/",
+    "arguments": {
+        "by_id_or_title": {
+            "apikey": {
+                "required": true,
+                "type": "str",
+                "description": "API key required to access the service. Get one at http://www.omdbapi.com/apikey.aspx",
+                "example": "apikey=12345678"
+            },
+            "i": {
+                "required": false,
+                "type": "str",
+                "description": "IMDb ID of the movie, series, or episode (format: 'tt' followed by 7 or 8 digits). *At least 'i' or 't' is required.*",
+                "example": "i=tt1285016"
+            },
+            "t": {
+                "required": false,
+                "type": "str",
+                "description": "Exact title of the movie, series, or episode. *At least 'i' or 't' is required.*",
+                "example": "t=Inception"
+            },
+            "type": {
+                "required": false,
+                "type": "str",
+                "valid_options": [
+                    "movie",
+                    "series",
+                    "episode"
+                ],
+                "default": null,
+                "description": "Type of result to return (movie, series, or episode).",
+                "example": "type=movie"
+            },
+            "y": {
+                "required": false,
+                "type": "str",
+                "description": "Year of release (4-digit year).",
+                "example": "y=2010"
+            },
+            "plot": {
+                "required": false,
+                "type": "str",
+                "valid_options": [
+                    "short",
+                    "full"
+                ],
+                "default": "short",
+                "description": "Return a short or full plot summary.",
+                "example": "plot=full"
+            },
+            "r": {
+                "required": false,
+                "type": "str",
+                "valid_options": [
+                    "json",
+                    "xml"
+                ],
+                "default": "json",
+                "description": "Response data format.",
+                "example": "r=json"
+            },
+            "callback": {
+                "required": false,
+                "type": "str",
+                "description": "Callback function name for JSONP support.",
+                "example": "callback=myFunction"
+            },
+            "v": {
+                "required": false,
+                "type": "str",
+                "default": "1",
+                "description": "API version (reserved for future use).",
+                "example": "v=1"
+            }
+        },
+        "by_search": {
+            "apikey": {
+                "required": true,
+                "type": "str",
+                "description": "API key required to access the service. Get one at http://www.omdbapi.com/apikey.aspx",
+                "example": "apikey=12345678"
+            },
+            "s": {
+                "required": true,
+                "type": "str",
+                "description": "Movie/series title to search for (keyword-based search).",
+                "example": "s=Joker"
+            },
+            "type": {
+                "required": false,
+                "type": "str",
+                "valid_options": [
+                    "movie",
+                    "series",
+                    "episode"
+                ],
+                "default": null,
+                "description": "Type of result to return (movie, series, or episode).",
+                "example": "type=movie"
+            },
+            "y": {
+                "required": false,
+                "type": "str",
+                "description": "Year of release (4-digit year).",
+                "example": "y=2019"
+            },
+            "r": {
+                "required": false,
+                "type": "str",
+                "valid_options": [
+                    "json",
+                    "xml"
+                ],
+                "default": "json",
+                "description": "Response data format.",
+                "example": "r=json"
+            },
+            "page": {
+                "required": false,
+                "type": "int",
+                "valid_options": [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    18,
+                    19,
+                    20,
+                    21,
+                    22,
+                    23,
+                    24,
+                    25,
+                    26,
+                    27,
+                    28,
+                    29,
+                    30,
+                    31,
+                    32,
+                    33,
+                    34,
+                    35,
+                    36,
+                    37,
+                    38,
+                    39,
+                    40,
+                    41,
+                    42,
+                    43,
+                    44,
+                    45,
+                    46,
+                    47,
+                    48,
+                    49,
+                    50,
+                    51,
+                    52,
+                    53,
+                    54,
+                    55,
+                    56,
+                    57,
+                    58,
+                    59,
+                    60,
+                    61,
+                    62,
+                    63,
+                    64,
+                    65,
+                    66,
+                    67,
+                    68,
+                    69,
+                    70,
+                    71,
+                    72,
+                    73,
+                    74,
+                    75,
+                    76,
+                    77,
+                    78,
+                    79,
+                    80,
+                    81,
+                    82,
+                    83,
+                    84,
+                    85,
+                    86,
+                    87,
+                    88,
+                    89,
+                    90,
+                    91,
+                    92,
+                    93,
+                    94,
+                    95,
+                    96,
+                    97,
+                    98,
+                    99,
+                    100
+                ],
+                "default": 1,
+                "description": "Page number to return (1\u2013100). Maximum 100 results per page.",
+                "example": "page=2"
+            },
+            "callback": {
+                "required": false,
+                "type": "str",
+                "description": "Callback function name for JSONP support.",
+                "example": "callback=myFunction"
+            },
+            "v": {
+                "required": false,
+                "type": "str",
+                "default": "1",
+                "description": "API version (reserved for future use).",
+                "example": "v=1"
+            }
+        }
+    },
+    "responses": {
+        "Title": {
+            "type": "str",
+            "description": "Title of the movie or series.",
+            "example": "Inception"
+        },
+        "Year": {
+            "type": "str",
+            "description": "Year of release (4-digit string).",
+            "example": "2010"
+        },
+        "Rated": {
+            "type": "str",
+            "description": "MPAA rating (e.g., 'PG-13', 'R') or 'N/A'.",
+            "example": "PG-13"
+        },
+        "Released": {
+            "type": "str",
+            "description": "Full release date (formatted as 'DD Mon YYYY').",
+            "example": "16 Jul 2010"
+        },
+        "Runtime": {
+            "type": "str",
+            "description": "Runtime in minutes (with ' min' suffix).",
+            "example": "148 min"
+        },
+        "Genre": {
+            "type": "str",
+            "description": "Comma-separated list of genres.",
+            "example": "Action, Sci-Fi, Thriller"
+        },
+        "Director": {
+            "type": "str",
+            "description": "Comma-separated list of directors. 'N/A' if unknown.",
+            "example": "Christopher Nolan"
+        },
+        "Writer": {
+            "type": "str",
+            "description": "Comma-separated list of writers. 'N/A' if unknown.",
+            "example": "Christopher Nolan"
+        },
+        "Actors": {
+            "type": "str",
+            "description": "Comma-separated list of lead actors. 'N/A' if unknown.",
+            "example": "Leonardo DiCaprio, Ken Watanabe, Joseph Gordon-Levitt"
+        },
+        "Plot": {
+            "type": "str",
+            "description": "Plot summary. Length depends on `plot=short` (default) or `plot=full`.",
+            "example": "A thief who steals corporate secrets through dream-sharing technology..."
+        },
+        "Language": {
+            "type": "str",
+            "description": "Comma-separated list of languages.",
+            "example": "English, Japanese, French"
+        },
+        "Country": {
+            "type": "str",
+            "description": "Comma-separated list of countries of origin.",
+            "example": "USA, UK"
+        },
+        "Awards": {
+            "type": "str",
+            "description": "Awards won/nominated. 'N/A' if none.",
+            "example": "Won 4 Oscars. Another 152 wins & 204 nominations."
+        },
+        "Poster": {
+            "type": "str",
+            "description": "URL to the poster image. 'N/A' if not available.",
+            "example": "https://m.media-amazon.com/images/M/MV5BMjAxMzY3NjcxNF5BMl5BanBnXkFtZTcwNTI5OTM0Mw@@._V1_SX300.jpg"
+        },
+        "Ratings": {
+            "type": "list[dict]",
+            "description": "List of ratings from various sources. Each dict has 'Source' and 'Value'.",
+            "example": [
+                {
+                    "Source": "Internet Movie Database",
+                    "Value": "8.8/10"
+                },
+                {
+                    "Source": "Rotten Tomatoes",
+                    "Value": "87%"
+                },
+                {
+                    "Source": "Metacritic",
+                    "Value": "74/100"
+                }
+            ]
+        },
+        "Metascore": {
+            "type": "str",
+            "description": "Metacritic score (0\u2013100). 'N/A' if not available.",
+            "example": "74"
+        },
+        "imdbRating": {
+            "type": "str",
+            "description": "IMDb rating out of 10.",
+            "example": "8.8"
+        },
+        "imdbVotes": {
+            "type": "str",
+            "description": "Number of votes on IMDb (with commas).",
+            "example": "2,345,678"
+        },
+        "imdbID": {
+            "type": "str",
+            "description": "Unique IMDb ID (starts with 'tt').",
+            "example": "tt1375666"
+        },
+        "Type": {
+            "type": "str",
+            "description": "Content type: 'movie', 'series', or 'episode'.",
+            "example": "movie"
+        },
+        "DVD": {
+            "type": "str",
+            "description": "DVD release date ('DD Mon YYYY') or 'N/A'.",
+            "example": "07 Dec 2010"
+        },
+        "BoxOffice": {
+            "type": "str",
+            "description": "Box office earnings (formatted with '$'). 'N/A' if unknown.",
+            "example": "$292,576,195"
+        },
+        "Production": {
+            "type": "str",
+            "description": "Production company. 'N/A' if unknown.",
+            "example": "Warner Bros., Legendary Entertainment"
+        },
+        "Website": {
+            "type": "str",
+            "description": "Official website URL. 'N/A' if none.",
+            "example": "http://inceptionmovie.warnerbros.com/"
+        },
+        "Response": {
+            "type": "str",
+            "description": "Indicates if request was successful: 'True' or 'False'.",
+            "example": "True"
+        }
+    }
+}
